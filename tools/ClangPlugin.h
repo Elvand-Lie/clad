@@ -27,6 +27,10 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 
+#if __has_feature(memory_sanitizer)
+#include <sanitizer/msan_interface.h>
+#endif
+
 #include <deque>
 #include <map>
 #include <set>
@@ -47,27 +51,24 @@ namespace clad {
 bool checkClangVersion();
 namespace plugin {
 struct DifferentiationOptions {
-  DifferentiationOptions()
-      : DumpSourceFn(false), DumpSourceFnAST(false), DumpDerivedFn(false),
-        DumpDerivedAST(false), GenerateSourceFile(false),
-        ValidateClangVersion(true), EnableTBRAnalysis(false),
-        DisableTBRAnalysis(false), EnableVariedAnalysis(false),
-        DisableVariedAnalysis(false), EnableUsefulAnalysis(false),
-        DisableUsefulAnalysis(false), PrintNumDiffErrorInfo(false) {}
-
-  bool DumpSourceFn : 1;
-  bool DumpSourceFnAST : 1;
-  bool DumpDerivedFn : 1;
-  bool DumpDerivedAST : 1;
-  bool GenerateSourceFile : 1;
-  bool ValidateClangVersion : 1;
-  bool EnableTBRAnalysis : 1;
-  bool DisableTBRAnalysis : 1;
-  bool EnableVariedAnalysis : 1;
-  bool DisableVariedAnalysis : 1;
-  bool EnableUsefulAnalysis : 1;
-  bool DisableUsefulAnalysis : 1;
-  bool PrintNumDiffErrorInfo : 1;
+  // Plain bool, not `: 1` bit-fields: with 13 single-bit bools packed
+  // into shared bytes, the compiler emits each ctor-init-list write as
+  // a read-modify-write of the storage byte. The first RMW reads the
+  // byte while it is still uninitialised, which MSan reports as a SEGV
+  // on uninitialised memory under -fsanitize=memory.
+  bool DumpSourceFn = false;
+  bool DumpSourceFnAST = false;
+  bool DumpDerivedFn = false;
+  bool DumpDerivedAST = false;
+  bool GenerateSourceFile = false;
+  bool ValidateClangVersion = true;
+  bool EnableTBRAnalysis = false;
+  bool DisableTBRAnalysis = false;
+  bool EnableVariedAnalysis = false;
+  bool DisableVariedAnalysis = false;
+  bool EnableUsefulAnalysis = false;
+  bool DisableUsefulAnalysis = false;
+  bool PrintNumDiffErrorInfo = false;
 };
 
     class CladExternalSource : public clang::ExternalSemaSource {
@@ -298,6 +299,16 @@ struct DifferentiationOptions {
 
       bool ParseArgs(const clang::CompilerInstance& CI,
                      const std::vector<std::string>& args) override {
+        // MSan: the `args` vector was constructed by clang and the
+        // shadow propagation across the clang->plugin DSO boundary
+        // through libc++'s _LIBCPP_HIDE_FROM_ABI accessors is
+        // unreliable. The bytes are real and initialized; unpoison
+        // them locally so the iteration below doesn't trip.
+#if __has_feature(memory_sanitizer)
+        __msan_unpoison(&args, sizeof(args));
+        for (const auto& s : args)
+          __msan_unpoison(&s, sizeof(s));
+#endif
         for (unsigned i = 0, e = args.size(); i != e; ++i) {
           if (args[i] == "-fdump-source-fn") {
             m_DO.DumpSourceFn = true;
