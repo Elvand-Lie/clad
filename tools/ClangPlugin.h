@@ -27,10 +27,6 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 
-#if __has_feature(memory_sanitizer)
-#include <sanitizer/msan_interface.h>
-#endif
-
 #include <deque>
 #include <map>
 #include <set>
@@ -299,16 +295,6 @@ struct DifferentiationOptions {
 
       bool ParseArgs(const clang::CompilerInstance& CI,
                      const std::vector<std::string>& args) override {
-        // MSan: the `args` vector was constructed by clang and the
-        // shadow propagation across the clang->plugin DSO boundary
-        // through libc++'s _LIBCPP_HIDE_FROM_ABI accessors is
-        // unreliable. The bytes are real and initialized; unpoison
-        // them locally so the iteration below doesn't trip.
-#if __has_feature(memory_sanitizer)
-        __msan_unpoison(&args, sizeof(args));
-        for (const auto& s : args)
-          __msan_unpoison(&s, sizeof(s));
-#endif
         for (unsigned i = 0, e = args.size(); i != e; ++i) {
           if (args[i] == "-fdump-source-fn") {
             m_DO.DumpSourceFn = true;
