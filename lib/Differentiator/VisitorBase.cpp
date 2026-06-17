@@ -241,15 +241,20 @@ namespace clad {
     return NDecl;
   }
 
-  NamespaceDecl* VisitorBase::RebuildEnclosingNamespaces(DeclContext* DC) {
+  unsigned VisitorBase::RebuildEnclosingNamespaces(DeclContext* DC) {
     if (NamespaceDecl* ND = dyn_cast_or_null<NamespaceDecl>(DC)) {
-      NamespaceDecl* Head = RebuildEnclosingNamespaces(ND->getDeclContext());
-      NamespaceDecl* NewD =
-          BuildNamespaceDecl(ND->getIdentifier(), ND->isInline());
-      return Head ? Head : NewD;
-    } else {
-      m_Sema.CurContext = DC;
-      return nullptr;
+      unsigned N = RebuildEnclosingNamespaces(ND->getDeclContext());
+      BuildNamespaceDecl(ND->getIdentifier(), ND->isInline());
+      return N + 1;
+    }
+    m_Sema.CurContext = DC;
+    return 0;
+  }
+
+  void VisitorBase::popEnclosingNamespaceScopes(unsigned N) {
+    for (unsigned i = 0; i < N; ++i) {
+      m_Sema.PopDeclContext();
+      endScope();
     }
   }
 
@@ -893,10 +898,12 @@ namespace clad {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
     auto* DC = const_cast<DeclContext*>(m_DiffReq->getDeclContext());
     m_Sema.CurContext = DC;
-    DeclWithContext diffOverloadFDWC =
+    // `cloned` owns its namespace Scopes; pops at end of this function,
+    // rebasing to the depth the outer Derive had on entry.
+    ClonedFunction cloned =
         m_Builder.cloneFunction(m_DiffReq.Function, *this, DC, noLoc,
                                 diffNameInfo, diffFunctionOverloadType);
-    FunctionDecl* diffOverloadFD = diffOverloadFDWC.first;
+    FunctionDecl* diffOverloadFD = cloned.fd;
 
     beginScope(Scope::FunctionPrototypeScope | Scope::FunctionDeclarationScope |
                Scope::DeclScope);
