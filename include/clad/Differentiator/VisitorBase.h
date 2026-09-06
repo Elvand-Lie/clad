@@ -82,9 +82,14 @@ namespace clad {
     // produces the node on first read, so a representation no consumer reads
     // constructs nothing (unlike a Lazy clone, it holds no template node). The
     // adjoint slot uses it for a reverse-mode leaf's rebuilt m_Variables ref,
-    // which a terminal product-rule leaf never reads.
+    // which a terminal product-rule leaf never reads. The rev-sweep slot uses
+    // it for values that require emitting a store (e.g. the post-assignment
+    // value of a discrete compound assignment); building it eagerly would emit
+    // a store -- in a loop, a tape push per iteration -- that nothing reads
+    // when the expression's value is never consumed in the reverse sweep.
     std::function<clang::Stmt*()> m_StmtBuild;
     std::function<clang::Stmt*()> m_StmtDxBuild;
+    std::function<clang::Stmt*()> m_RevSweepBuild;
 
     // Clone Src into Slot on first read; a no-op when Src is null (eager slot).
     clang::Stmt* materialize(clang::Stmt*& Slot, const clang::Stmt*& Src);
@@ -141,7 +146,8 @@ namespace clad {
             return valueForRevSweep.Deferred.Cloner;
           }()),
           m_StmtBuild(std::move(orig.Build)),
-          m_StmtDxBuild(std::move(diff.Build)) {
+          m_StmtDxBuild(std::move(diff.Build)),
+          m_RevSweepBuild(std::move(valueForRevSweep.Build)) {
       m_Data[1] = orig.Node;
       m_Data[0] = diff.Node;
     }
@@ -182,6 +188,7 @@ namespace clad {
     void updateRevSweep(clang::Stmt* S) {
       m_ValueForRevSweep = S;
       m_RevSweepSrc = nullptr;
+      m_RevSweepBuild = nullptr;
     }
     // Stmt_dx goes first!
     std::array<clang::Stmt*, 2>& getBothStmts() {
@@ -197,6 +204,10 @@ namespace clad {
     }
 
     clang::Stmt* getRevSweepStmt() {
+      if (!m_ValueForRevSweep && m_RevSweepBuild) {
+        m_ValueForRevSweep = m_RevSweepBuild();
+        m_RevSweepBuild = nullptr;
+      }
       if (clang::Stmt* R = materialize(m_ValueForRevSweep, m_RevSweepSrc))
         return R;
       // If there is no specific value for the reverse sweep, use the forward

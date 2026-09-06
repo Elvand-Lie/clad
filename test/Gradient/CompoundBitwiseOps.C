@@ -12,9 +12,16 @@ double f_rem(double x, int y) {
 }
 
 // CHECK-LABEL: f_rem_grad
-// CHECK: int &_ref0 = n %= y;
-// CHECK: *_d_x += 1 * n;
-// CHECK: _d_n = 0;
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int n = 10;
+// CHECK-NEXT:     int &_ref0 = n %= y;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         *_d_x += 1 * n;
+// CHECK-NEXT:         _d_n += x * 1;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     _d_n = 0;
+// CHECK-NEXT: }
 
 // 2. &= operator
 double f_and(double x, int y) {
@@ -24,7 +31,17 @@ double f_and(double x, int y) {
 }
 
 // CHECK-LABEL: f_and_grad
-// CHECK: int &_ref0 = n &= 7;
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int n = y;
+// CHECK-NEXT:     int &_ref0 = n &= 7;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         *_d_x += 1 * n;
+// CHECK-NEXT:         _d_n += x * 1;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     _d_n = 0;
+// CHECK-NEXT:     _d_y += _d_n;
+// CHECK-NEXT: }
 
 // 3. |= operator
 double f_or(double x, int y) {
@@ -34,7 +51,17 @@ double f_or(double x, int y) {
 }
 
 // CHECK-LABEL: f_or_grad
-// CHECK: int &_ref0 = n |= 3;
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int n = y;
+// CHECK-NEXT:     int &_ref0 = n |= 3;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         *_d_x += 1 * n;
+// CHECK-NEXT:         _d_n += x * 1;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     _d_n = 0;
+// CHECK-NEXT:     _d_y += _d_n;
+// CHECK-NEXT: }
 
 // 4. ^= operator
 double f_xor(double x, int y) {
@@ -44,7 +71,17 @@ double f_xor(double x, int y) {
 }
 
 // CHECK-LABEL: f_xor_grad
-// CHECK: int &_ref0 = n ^= 5;
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int n = y;
+// CHECK-NEXT:     int &_ref0 = n ^= 5;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         *_d_x += 1 * n;
+// CHECK-NEXT:         _d_n += x * 1;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     _d_n = 0;
+// CHECK-NEXT:     _d_y += _d_n;
+// CHECK-NEXT: }
 
 // 5. <<= operator
 double f_shl(double x, int y) {
@@ -54,7 +91,17 @@ double f_shl(double x, int y) {
 }
 
 // CHECK-LABEL: f_shl_grad
-// CHECK: int &_ref0 = n <<= 2;
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int n = y;
+// CHECK-NEXT:     int &_ref0 = n <<= 2;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         *_d_x += 1 * n;
+// CHECK-NEXT:         _d_n += x * 1;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     _d_n = 0;
+// CHECK-NEXT:     _d_y += _d_n;
+// CHECK-NEXT: }
 
 // 6. >>= operator
 double f_shr(double x, int y) {
@@ -64,7 +111,17 @@ double f_shr(double x, int y) {
 }
 
 // CHECK-LABEL: f_shr_grad
-// CHECK: int &_ref0 = n >>= 1;
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int n = y;
+// CHECK-NEXT:     int &_ref0 = n >>= 1;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         *_d_x += 1 * n;
+// CHECK-NEXT:         _d_n += x * 1;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     _d_n = 0;
+// CHECK-NEXT:     _d_y += _d_n;
+// CHECK-NEXT: }
 
 // 7. Compound assignment inside a loop
 double f_loop(double x, int n) {
@@ -79,8 +136,33 @@ double f_loop(double x, int n) {
 }
 
 // CHECK-LABEL: f_loop_grad
-// CHECK: _d_mask = 0;
-// CHECK: int &_ref0 = mask %= 4;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int _d_i = 0;
+// CHECK-NEXT:     int i = 0;
+// CHECK-NEXT:     clad::tape<int> _t1 = {};
+// CHECK-NEXT:     double _d_res = 0.;
+// CHECK-NEXT:     double res = x;
+// CHECK-NEXT:     int _d_mask = 0;
+// CHECK-NEXT:     int mask = 15;
+// CHECK-NEXT:     unsigned long _t0 = 0;
+// CHECK-NEXT:     for (i = 0; i < n; ++i) {
+// CHECK-NEXT:         _t0++;
+// CHECK-NEXT:         int &_ref0 = mask %= 4;
+// CHECK-NEXT:         res += x * mask;
+// CHECK-NEXT:         clad::push(_t1, mask);
+// CHECK-NEXT:         mask += 5;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     _d_res += 1;
+// CHECK-NEXT:     for (; _t0; _t0--) {
+// CHECK-NEXT:         mask = clad::pop(_t1);
+// CHECK-NEXT:         {
+// CHECK-NEXT:             *_d_x += _d_res * mask;
+// CHECK-NEXT:             _d_mask += x * _d_res;
+// CHECK-NEXT:         }
+// CHECK-NEXT:         _d_mask = 0;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     *_d_x += _d_res;
+// CHECK-NEXT: }
 
 // 8. Nested %= expression
 double f_nested_rem(double x, int y) {
@@ -89,9 +171,18 @@ double f_nested_rem(double x, int y) {
 }
 
 // CHECK-LABEL: f_nested_rem_grad
-// CHECK: int &[[REF0:_ref[0-9]+]] = n %= y;
-// CHECK: double [[T0:_t[0-9]+]] = [[REF0]];
-// CHECK: *_d_x += 1 * [[T0]];
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int n = 10;
+// CHECK-NEXT:     int &_ref0 = n %= y;
+// CHECK-NEXT:     int _t1 = _ref0;
+// CHECK-NEXT:     double _t0 = _ref0;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         *_d_x += 1 * _t0;
+// CHECK-NEXT:         _d_n += x * 1;
+// CHECK-NEXT:         _d_n = 0;
+// CHECK-NEXT:     }
+// CHECK-NEXT: }
 
 // 9. Nested &= expression
 double f_nested_and(double x, int y) {
@@ -100,9 +191,21 @@ double f_nested_and(double x, int y) {
 }
 
 // CHECK-LABEL: f_nested_and_grad
-// CHECK: int &[[REF0:_ref[0-9]+]] = n &= y;
-// CHECK: double [[T0:_t[0-9]+]] = [[REF0]];
-// CHECK: *_d_x += 1 * [[T0]];
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int n = 11;
+// CHECK-NEXT:     int &_ref0 = n &= y;
+// CHECK-NEXT:     int _t1 = _ref0;
+// CHECK-NEXT:     double _t0 = _ref0;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         *_d_x += 1 * _t0;
+// CHECK-NEXT:         _d_n += x * 1;
+// CHECK-NEXT:         _d_n = 0;
+// CHECK-NEXT:     }
+// CHECK-NEXT: }
+// CHECK-NEXT: inline void next_pullback(int &y, int _d_y0, int *_d_y) {
+// CHECK-NEXT:     *_d_y += _d_y0;
+// CHECK-NEXT: }
 
 int next(int& y) {
   return ++y;
@@ -115,8 +218,21 @@ double f_nested_side_effect(double x, int y) {
 }
 
 // CHECK-LABEL: f_nested_side_effect_grad
-// CHECK: int &[[SIDE_REF:_ref[0-9]+]] = n %= next(y);
-// CHECK-NOT: next(y)
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int n = 10;
+// CHECK-NEXT:     int _t1 = y;
+// CHECK-NEXT:     int &_ref0 = n %= next(y);
+// CHECK-NEXT:     int _t2 = _ref0;
+// CHECK-NEXT:     double _t0 = _ref0;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         *_d_x += 1 * _t0;
+// CHECK-NEXT:         _d_n += x * 1;
+// CHECK-NEXT:         _d_n = 0;
+// CHECK-NEXT:         y = _t1;
+// CHECK-NEXT:         next_pullback(y, 0, &_d_y);
+// CHECK-NEXT:     }
+// CHECK-NEXT: }
 
 // 11. Compound assignment inside a loop with RHS side effect
 double f_loop_side_effect(double x, int n, int y) {
@@ -130,8 +246,39 @@ double f_loop_side_effect(double x, int n, int y) {
 }
 
 // CHECK-LABEL: f_loop_side_effect_grad
-// CHECK: int &[[LOOP_SIDE_REF:_ref[0-9]+]] = mask %= next(y);
-// CHECK-NOT: next(y)
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_i = 0;
+// CHECK-NEXT:     int i = 0;
+// CHECK-NEXT:     clad::tape<int> _t1 = {};
+// CHECK-NEXT:     clad::tape<int> _t2 = {};
+// CHECK-NEXT:     double _d_res = 0.;
+// CHECK-NEXT:     double res = x;
+// CHECK-NEXT:     int _d_mask = 0;
+// CHECK-NEXT:     int mask = 15;
+// CHECK-NEXT:     unsigned long _t0 = 0;
+// CHECK-NEXT:     for (i = 0; i < n; ++i) {
+// CHECK-NEXT:         _t0++;
+// CHECK-NEXT:         clad::push(_t1, mask);
+// CHECK-NEXT:         clad::push(_t2, y);
+// CHECK-NEXT:         int &_ref0 = mask %= next(y);
+// CHECK-NEXT:         res += x * mask;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     _d_res += 1;
+// CHECK-NEXT:     for (; _t0; _t0--) {
+// CHECK-NEXT:         {
+// CHECK-NEXT:             *_d_x += _d_res * mask;
+// CHECK-NEXT:             _d_mask += x * _d_res;
+// CHECK-NEXT:         }
+// CHECK-NEXT:         {
+// CHECK-NEXT:             mask = clad::pop(_t1);
+// CHECK-NEXT:             _d_mask = 0;
+// CHECK-NEXT:             y = clad::pop(_t2);
+// CHECK-NEXT:             next_pullback(y, 0, &_d_y);
+// CHECK-NEXT:         }
+// CHECK-NEXT:     }
+// CHECK-NEXT:     *_d_x += _d_res;
+// CHECK-NEXT: }
 
 // 12. Nested XOR under parent compound assignment (*=)
 double nested_xor_mul_assign(double x, int y) {
@@ -142,10 +289,26 @@ double nested_xor_mul_assign(double x, int y) {
 }
 
 // CHECK-LABEL: nested_xor_mul_assign_grad
-// CHECK: int &[[XOR_REF:_ref[0-9]+]] = n ^= y;
-// CHECK-NOT: n ^= y
-// CHECK: [[XOR_VALUE:_t[0-9]+]] = [[XOR_REF]];
-// CHECK-NOT: n ^= y
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     double _d_result = 0.;
+// CHECK-NEXT:     double result = x;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int n = 12;
+// CHECK-NEXT:     double _t0 = result;
+// CHECK-NEXT:     int &_ref0 = n ^= y;
+// CHECK-NEXT:     int _t1 = _ref0;
+// CHECK-NEXT:     result *= _ref0;
+// CHECK-NEXT:     _d_result += 1;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         result = _t0;
+// CHECK-NEXT:         double _r_d0 = _d_result;
+// CHECK-NEXT:         _d_result = 0.;
+// CHECK-NEXT:         _d_result += _r_d0 * _t1;
+// CHECK-NEXT:         _d_n += result * _r_d0;
+// CHECK-NEXT:         _d_n = 0;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     *_d_x += _d_result;
+// CHECK-NEXT: }
 
 // 13. Nested left shift under parent compound assignment (*=)
 double nested_shl_mul_assign(double x, int shift) {
@@ -181,9 +344,86 @@ double nested_xor_loop(double x, int count, int y) {
 }
 
 // CHECK-LABEL: nested_xor_loop_grad
-// CHECK: int &[[LOOP_REF:_ref[0-9]+]] = n ^= y;
-// CHECK: clad::push([[LOOP_TAPE:_t[0-9]+]], [[LOOP_REF]]);
-// CHECK: clad::pop([[LOOP_TAPE]])
+// CHECK-NEXT:     int _d_count = 0;
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_i = 0;
+// CHECK-NEXT:     int i = 0;
+// CHECK-NEXT:     clad::tape<double> _t1 = {};
+// CHECK-NEXT:     clad::tape<int> _t2 = {};
+// CHECK-NEXT:     clad::tape<int> _t3 = {};
+// CHECK-NEXT:     double _d_result = 0.;
+// CHECK-NEXT:     double result = x;
+// CHECK-NEXT:     int _d_n = 0;
+// CHECK-NEXT:     int n = 12;
+// CHECK-NEXT:     unsigned long _t0 = 0;
+// CHECK-NEXT:     for (i = 0; i < count; ++i) {
+// CHECK-NEXT:         _t0++;
+// CHECK-NEXT:         clad::push(_t1, result);
+// CHECK-NEXT:         clad::push(_t2, n);
+// CHECK-NEXT:         int &_ref0 = n ^= y;
+// CHECK-NEXT:         clad::push(_t3, _ref0);
+// CHECK-NEXT:         result *= _ref0;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     _d_result += 1;
+// CHECK-NEXT:     for (; _t0; _t0--) {
+// CHECK-NEXT:         result = clad::pop(_t1);
+// CHECK-NEXT:         double _r_d0 = _d_result;
+// CHECK-NEXT:         _d_result = 0.;
+// CHECK-NEXT:         _d_result += _r_d0 * clad::back(_t3);
+// CHECK-NEXT:         _d_n += result * _r_d0;
+// CHECK-NEXT:         n = clad::pop(_t2);
+// CHECK-NEXT:         _d_n = 0;
+// CHECK-NEXT:         clad::pop(_t3);
+// CHECK-NEXT:     }
+// CHECK-NEXT:     *_d_x += _d_result;
+// CHECK-NEXT: }
+
+// 17. Bit-field LHS: reference binding is ill-formed ([class.bit]/5),
+// so the generated code must not bind T& to the result.
+struct Bits { int flags : 8; };
+double f_bitfield(double x, int mask) {
+  Bits b;
+  b.flags = 12;
+  b.flags &= mask;
+  return x * b.flags;
+}
+
+// CHECK-LABEL: f_bitfield_grad
+// CHECK-NOT: int &{{.*}} = b.flags &= mask
+// CHECK-NEXT:     int _d_mask = 0;
+// CHECK-NEXT:     Bits _d_b = {0};
+// CHECK-NEXT:     Bits b;
+// CHECK-NEXT:     b.flags = 12;
+// CHECK-NEXT:     b.flags &= mask;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         *_d_x += 1 * b.flags;
+// CHECK-NEXT:         _d_b.flags += x * 1;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     _d_b.flags = 0;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         int _r_d0 = _d_b.flags;
+// CHECK-NEXT:         _d_b.flags = 0;
+// CHECK-NEXT:     }
+// CHECK-NEXT: }
+
+// 18. Array subscript LHS
+double f_arr_rem(double x, int y) {
+  int arr[2] = {10, 20};
+  arr[0] %= y;
+  return x * arr[0];
+}
+
+// CHECK-LABEL: f_arr_rem_grad
+// CHECK-NEXT:     int _d_y = 0;
+// CHECK-NEXT:     int _d_arr[2] = {0};
+// CHECK-NEXT:     int arr[2] = {10, 20};
+// CHECK-NEXT:     int &_ref0 = arr[0] %= y;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         *_d_x += 1 * arr[0];
+// CHECK-NEXT:         _d_arr[0] += x * 1;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     _d_arr[0] = 0;
+// CHECK-NEXT: }
 
 int main() {
   // Test 1: rem (10 % 3 = 1 -> df/dx = 1)
@@ -297,6 +537,20 @@ int main() {
   df_nested_xor_loop.execute(2.0, 2, 5, &dx_nested_xor_loop);
   std::cout << "nested_xor_loop df/dx = " << dx_nested_xor_loop << std::endl;
   // CHECK-EXEC: nested_xor_loop df/dx = 108
+
+  // Test 17: bit-field LHS (12 & 5 = 4 -> df/dx = 4)
+  auto df_bitfield = clad::gradient(f_bitfield, "x");
+  double dx_bitfield = 0;
+  df_bitfield.execute(3.0, 5, &dx_bitfield);
+  std::cout << "f_bitfield df/dx = " << dx_bitfield << std::endl;
+  // CHECK-EXEC: f_bitfield df/dx = 4
+
+  // Test 18: array subscript LHS (10 % 3 = 1 -> df/dx = 1)
+  auto df_arr_rem = clad::gradient(f_arr_rem, "x");
+  double dx_arr_rem = 0;
+  df_arr_rem.execute(5.0, 3, &dx_arr_rem);
+  std::cout << "f_arr_rem df/dx = " << dx_arr_rem << std::endl;
+  // CHECK-EXEC: f_arr_rem df/dx = 1
 
   return 0;
 }

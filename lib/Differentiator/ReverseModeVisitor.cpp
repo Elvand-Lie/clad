@@ -2984,6 +2984,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
     StmtDiff Rdiff{};
     StmtDiff Lstored{};
     Expr* valueForRevPass = nullptr;
+    StmtDiff::In discreteRevSweep{};
     Expr* primalResult = nullptr;
     auto* L = BinOp->getLHS();
     auto* R = BinOp->getRHS();
@@ -3387,26 +3388,34 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
             BuildOp(BO_Div, BuildParens(Rdiff.getRevSweepAsExpr()),
                     BuildParens(Ldiff.getRevSweepAsExpr()));
         std::tie(Ldiff, Rdiff) = std::make_pair(LCloned, RResult);
-      } else if (opCode == BO_RemAssign || opCode == BO_AndAssign ||
-                 opCode == BO_OrAssign || opCode == BO_XorAssign ||
-                 opCode == BO_ShlAssign || opCode == BO_ShrAssign) {
+      } else if (isDiscreteAssign) {
+        // isPointerOp is always false here: bitwise/shift/rem require integral
+        // operands. The guard is kept for structural parity with other branches.
         if (ResultRef && !isPointerOp) {
           Expr* zero = getZeroInit(ResultRef->getType());
           Expr* assign_zero = BuildOp(BO_Assign, CloneNode(ResultRef), zero);
           addToCurrentBlock(assign_zero, direction::reverse);
         }
-        Rdiff = Visit(R, static_cast<Expr*>(nullptr));
+        Rdiff = Visit(R);
         Expr* assignExpr = BuildOp(opCode, Ldiff.getExpr(), Rdiff.getExpr());
         QualType valueType =
             utils::getNonConstType(Ldiff.getExpr()->getType(), m_Sema);
-        QualType referenceType = m_Context.getLValueReferenceType(valueType);
-        Expr* forwardResult =
-            StoreAndRef(assignExpr, referenceType, direction::forward, "_ref",
-                        /*forceDeclCreation=*/true);
-        valueForRevPass =
-            GlobalStoreAndRef(CloneNode(forwardResult), valueType, "_t",
-                              /*force=*/true);
-        primalResult = forwardResult;
+        bool isBitField = L->IgnoreParenImpCasts()->refersToBitField();
+        if (isBitField) {
+          addToCurrentBlock(assignExpr, direction::forward);
+          primalResult = CloneNode(LCloned);
+        } else {
+          QualType referenceType = m_Context.getLValueReferenceType(valueType);
+          Expr* forwardResult =
+              StoreAndRef(assignExpr, referenceType, direction::forward, "_ref",
+                          /*forceDeclCreation=*/true);
+          primalResult = forwardResult;
+        }
+        discreteRevSweep = LazyBuild(
+            [this, primalResult, valueType]() -> Stmt* {
+              return GlobalStoreAndRef(CloneNode(primalResult), valueType, "_t",
+                                       /*force=*/true);
+            });
       } else
         llvm_unreachable("unknown assignment opCode");
       if (m_ExternalSource)
@@ -3494,7 +3503,8 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
             addToCurrentBlock(memsetCall, direction::forward);
       }
     }
-    return StmtDiff(op, ResultRef, valueForRevPass);
+    return StmtDiff(op, ResultRef,
+                    discreteRevSweep.Build ? discreteRevSweep : valueForRevPass);
   }
 
   QualType ReverseModeVisitor::CloneType(QualType T) {
