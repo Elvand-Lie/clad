@@ -147,6 +147,9 @@ private:
   mutable struct ActivityRunInfo {
     std::set<const clang::VarDecl*> VariedDecls;
     std::set<const clang::Stmt*> VariedS;
+    /// Whether a call of the primal has a varied argument. Only filled for
+    /// requests varied analysis has run on; see shouldHavePushforward().
+    llvm::DenseMap<const clang::CallExpr*, bool> VariedCalls;
     bool HasAnalysisRun = false;
   } m_ActivityRunInfo;
 
@@ -230,12 +233,21 @@ public:
   bool CallUpdateRequired = false;
   /// A flag to enable/disable diag warnings/errors during differentiation.
   bool VerboseDiags = false;
-  /// A flag to enable TBR analysis during reverse-mode differentiation.
-  bool EnableTBRAnalysis = false;
-  /// A flag to enable varied analysis during reverse-mode differentiation.
-  bool EnableVariedAnalysis = false;
-  /// A flag to enable useful analysis during reverse-mode differentiation.
-  bool EnableUsefulAnalysis = false;
+  /// Whether each analysis runs for this request. One member per entry in
+  /// Analyses.def, spelled Enable<Id>Analysis.
+#define CLAD_ANALYSIS(Id, Name, Legacy, Default, Desc)                         \
+  bool Enable##Id##Analysis = false;
+#include "clad/Differentiator/Analyses.def"
+
+  /// Run the same analyses \p Other runs. A derived request -- the pullback of
+  /// a callee, the pushforward of a nested call -- covers a different
+  /// function, but the user asked for the analyses once, for the whole
+  /// differentiation.
+  void inheritAnalysesFrom(const DiffRequest& Other) {
+#define CLAD_ANALYSIS(Id, Name, Legacy, Default, Desc)                         \
+  Enable##Id##Analysis = Other.Enable##Id##Analysis;
+#include "clad/Differentiator/Analyses.def"
+  }
   /// A flag to emit porting-hint remarks (-fclad-porting-hints) when a function
   /// defined outside the main source file is differentiated by cloning its
   /// definition. Diagnostic-only; it does not affect the generated derivative
@@ -250,6 +262,12 @@ public:
   /// A flag specifying whether this differentiation is to be used
   /// for error estimation.
   bool EnableErrorEstimation = false;
+  /// Assemble the hessian from hessian-vector products -- one pushforward of
+  /// the function and one pullback of it -- instead of one second-order
+  /// function per direction. The planner decides this (and schedules the
+  /// pushforward); HessianModeVisitor only consumes the decision. Derived
+  /// from Function, Mode and Args, so excluded from request equality.
+  bool UseHessianVectorProducts = false;
   /// Puts the derived function and its code in the diff call
   void updateCall(clang::FunctionDecl* FD, clang::FunctionDecl* OverloadedFD,
                   clang::Sema& SemaRef);
@@ -326,6 +344,13 @@ public:
   ///      function will be differentiated w.r.t. to its every parameter.
   void UpdateDiffParamsInfo(clang::Sema& semaRef);
 
+  /// The pushforward request a hessian assembled from hessian-vector products
+  /// consumes. One factory serves both sides: the planner schedules the
+  /// request this builds, and HessianModeVisitor builds it again to find that
+  /// scheduled derivative, so the two must stay structurally identical.
+  [[nodiscard]] DiffRequest
+  pushforwardRequestForHessian(clang::Sema& semaRef) const;
+
   /// Allow comparing DiffRequests.
   bool operator==(const DiffRequest& other) const {
     // Note that CallContext is always different and we should ignore it.
@@ -363,6 +388,11 @@ public:
   bool shouldHaveAdjoint(const clang::VarDecl* VD) const;
   bool shouldHaveAdjointForw(const clang::VarDecl* VD) const;
   bool isVaried(const clang::Expr* E) const;
+  /// Whether forward mode has to differentiate through the call \p CE. False
+  /// only when varied analysis proved that no argument of the call depends on
+  /// the direction this request differentiates along. A call the analysis
+  /// never saw answers true.
+  [[nodiscard]] bool shouldHavePushforward(const clang::CallExpr* CE) const;
   std::string ComputeDerivativeName() const;
   bool HasIndependentParameter(const clang::ParmVarDecl* PVD) const;
 
@@ -383,6 +413,22 @@ public:
   void addVariedDecl(const clang::VarDecl* init) {
     m_ActivityRunInfo.VariedDecls.insert(init);
   }
+
+  /// Records whether varied analysis found a varied argument of the call
+  /// \p CE. Only a forward-mode request is analyzed along exactly the
+  /// direction it differentiates; other -enable-va runs are unseeded or
+  /// seeded for a caller, and their verdicts must not drop pushforwards.
+  /// Monotone, because a loop body is passed over more than once and a later
+  /// pass may find an argument varied.
+  void recordCallActivity(const clang::CallExpr* CE, bool isVaried) const {
+    if (Mode == DiffMode::forward)
+      m_ActivityRunInfo.VariedCalls[CE] |= isVaried;
+  }
+
+  /// Drops the result of a previous varied-analysis run. A request reused for
+  /// another direction -- as the hessian reuses one forward request per row --
+  /// has to be analyzed from scratch.
+  void resetActivityInfo() const { m_ActivityRunInfo = ActivityRunInfo(); }
   std::set<const clang::VarDecl*>& getVariedDecls() const {
     return m_ActivityRunInfo.VariedDecls;
   }
@@ -405,11 +451,11 @@ using DiffInterval = std::vector<clang::SourceRange>;
 // FIXME: These are translation-unit-wide defaults taken from the compiler
 // invocation, not the options of a request; rename to InvocationOptions.
 struct RequestOptions {
-  /// This is a flag to indicate the default behaviour to enable/disable
-  /// TBR analysis during reverse-mode differentiation.
-  bool EnableTBRAnalysis = false;
-  bool EnableVariedAnalysis = false;
-  bool EnableUsefulAnalysis = false;
+  /// Whether each analysis runs, once the switches on the command line have
+  /// been resolved against the defaults in Analyses.def.
+#define CLAD_ANALYSIS(Id, Name, Legacy, Default, Desc)                         \
+  bool Enable##Id##Analysis = Default;
+#include "clad/Differentiator/Analyses.def"
   bool EmitPortingHints = false;
 };
 

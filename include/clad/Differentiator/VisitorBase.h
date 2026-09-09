@@ -82,9 +82,13 @@ namespace clad {
     // produces the node on first read, so a representation no consumer reads
     // constructs nothing (unlike a Lazy clone, it holds no template node). The
     // adjoint slot uses it for a reverse-mode leaf's rebuilt m_Variables ref,
-    // which a terminal product-rule leaf never reads.
+    // which a terminal product-rule leaf never reads. The rev-sweep slot keeps
+    // the same LazyBuild infrastructure; discrete compound assignments use it
+    // for a consumed-only snapshot (lazy Pop/store) so discarded standalones
+    // never push.
     std::function<clang::Stmt*()> m_StmtBuild;
     std::function<clang::Stmt*()> m_StmtDxBuild;
+    std::function<clang::Stmt*()> m_RevSweepBuild;
 
     // Clone Src into Slot on first read; a no-op when Src is null (eager slot).
     clang::Stmt* materialize(clang::Stmt*& Slot, const clang::Stmt*& Src);
@@ -141,7 +145,8 @@ namespace clad {
             return valueForRevSweep.Deferred.Cloner;
           }()),
           m_StmtBuild(std::move(orig.Build)),
-          m_StmtDxBuild(std::move(diff.Build)) {
+          m_StmtDxBuild(std::move(diff.Build)),
+          m_RevSweepBuild(std::move(valueForRevSweep.Build)) {
       m_Data[1] = orig.Node;
       m_Data[0] = diff.Node;
     }
@@ -182,6 +187,7 @@ namespace clad {
     void updateRevSweep(clang::Stmt* S) {
       m_ValueForRevSweep = S;
       m_RevSweepSrc = nullptr;
+      m_RevSweepBuild = nullptr;
     }
     // Stmt_dx goes first!
     std::array<clang::Stmt*, 2>& getBothStmts() {
@@ -196,12 +202,31 @@ namespace clad {
       return llvm::cast_or_null<clang::Expr>(getRevSweepStmt());
     }
 
+    bool hasRevSweep() const {
+      return m_ValueForRevSweep || m_RevSweepBuild || m_RevSweepSrc;
+    }
+
+    bool hasRevSweepBuild() const { return static_cast<bool>(m_RevSweepBuild); }
+
     clang::Stmt* getRevSweepStmt() {
+      if (!m_ValueForRevSweep && m_RevSweepBuild) {
+        m_ValueForRevSweep = m_RevSweepBuild();
+        m_RevSweepBuild = nullptr;
+      }
       if (clang::Stmt* R = materialize(m_ValueForRevSweep, m_RevSweepSrc))
         return R;
       // If there is no specific value for the reverse sweep, use the forward
       // statement.
       return getStmt();
+    }
+
+    /// Materialize a pending reverse-sweep LazyBuild (e.g. discrete snapshot)
+    /// before CloneNode(getExpr()). In-place FwdWrapper upgrades must run on
+    /// the canonical node first; cloning an un-upgraded wrapper loses the
+    /// store.
+    void prepareForFwdClone() {
+      if (m_RevSweepBuild)
+        getRevSweepStmt();
     }
   };
 
@@ -811,6 +836,20 @@ namespace clad {
                                  const std::string& nmspace,
                                  llvm::SmallVectorImpl<clang::Expr*>& callArgs);
 
+    /// Builds a call to \p Callee, giving its parentheses locations of their
+    /// own.
+    ///
+    /// A generated call has no parentheses anyone wrote, so the caller of
+    /// Sema::ActOnCallExpr has to say where they are. Deciding that here
+    /// rather than at each site is what makes one generated call tell apart
+    /// from another. Returns null if Sema rejects the call.
+    clang::Expr* BuildCallExpr(clang::Expr* Callee,
+                               llvm::MutableArrayRef<clang::Expr*> Args);
+
+    /// Builds a braced initializer over \p Elements, giving its braces
+    /// locations of their own. Same reason as BuildCallExpr.
+    clang::Expr* BuildInitList(llvm::MutableArrayRef<clang::Expr*> Elements);
+
     clang::DeclRefExpr* GetCladTapePushDRE();
 
     clang::Stmt* GetCladZeroInit(llvm::MutableArrayRef<clang::Expr*> args);
@@ -885,17 +924,31 @@ namespace clad {
                             clang::Expr* CUDAExecConfig = nullptr,
                             bool useRefQualifiedThisObj = false);
 
+    /// A location for a node about to be built, distinct from every other one
+    /// handed out.
+    clang::SourceLocation GenLoc();
+
+    /// Build a return statement. The `return` keyword is not one the user
+    /// wrote, so the location comes from here rather than from the caller.
+    clang::Stmt* BuildReturnStmt(clang::Expr* E);
+
+    /// Build `T(E)`. The parentheses are not ones the user wrote, so their
+    /// locations come from here rather than from the caller.
+    clang::Expr* BuildFunctionalCast(clang::TypeSourceInfo* TSI,
+                                     clang::QualType T, clang::Expr* E);
+
+    /// Build `(T)E`, likewise.
+    clang::Expr* BuildCStyleCast(clang::TypeSourceInfo* TSI, clang::Expr* E);
+
     /// Build a call to templated free function inside the clad namespace.
     ///
     /// \param[in] name name of the function
     /// \param[in] argExprs function arguments expressions
     /// \param[in] templateArgs template arguments
-    /// \param[in] loc location of the call
     /// \returns Built call expression
     clang::Expr* BuildCallExprToCladFunction(
         llvm::StringRef name, llvm::MutableArrayRef<clang::Expr*> argExprs,
-        llvm::ArrayRef<clang::TemplateArgument> templateArgs,
-        clang::SourceLocation loc);
+        llvm::ArrayRef<clang::TemplateArgument> templateArgs);
 
     /// Checks if the type is of clad::array<T> or clad::array_ref<T> type
     bool isCladArrayType(clang::QualType QT);
@@ -904,8 +957,7 @@ namespace clad {
     /// type and args.
     clang::Expr*
     BuildIdentityMatrixExpr(clang::QualType T,
-                            llvm::MutableArrayRef<clang::Expr*> Args,
-                            clang::SourceLocation Loc);
+                            llvm::MutableArrayRef<clang::Expr*> Args);
     /// Creates the expression Base.size() for the given Base expr. The Base
     /// expr must be of clad::array_ref<T> type
     clang::Expr* BuildArrayRefSizeExpr(clang::Expr* Base);
@@ -994,9 +1046,10 @@ namespace clad {
     StmtDiff::Lazy LazyClone(const clang::Stmt* N) {
       return {m_Builder.m_NodeCloner.get(), N};
     }
-    /// A StmtDiff forward-value input that runs \p B on first read and nothing
+    /// A StmtDiff representation input that runs \p B on first read and nothing
     /// if the value is never read -- for a representation that is freshly
-    /// constructed (e.g. BuildDeclRef of a remapped decl) rather than cloned,
+    /// constructed (e.g. BuildDeclRef of a remapped decl, or a reverse-sweep
+    /// snapshot that would otherwise emit an unused store) rather than cloned,
     /// so LazyClone's template node is not orphaned.
     StmtDiff::In LazyBuild(std::function<clang::Stmt*()> B) {
       return StmtDiff::In(std::move(B));
