@@ -342,6 +342,27 @@ namespace clad {
       return QT->isArrayType() || QT->isPointerType();
     }
 
+    bool canUseHessianVectorProducts(const clang::FunctionDecl* FD) {
+      // The wrapper passes tangents and adjoints by position and the hessian
+      // matrix has no place for `this`.
+      if (const auto* MD = dyn_cast<CXXMethodDecl>(FD))
+        if (MD->isInstance())
+          return false;
+      for (const ParmVarDecl* PVD : FD->parameters()) {
+        QualType T = PVD->getType();
+        // The wrapper needs one tangent per parameter: a parameter the
+        // pushforward's signature filter skips leaves the wrapper and the
+        // pushforward disagreeing on positions.
+        if (!IsDifferentiableType(T))
+          return false;
+        // A reference tangent can be neither reseeded between directions nor
+        // zero-initialized for a parameter no direction runs through.
+        if (T->isReferenceType())
+          return false;
+      }
+      return true;
+    }
+
     bool isLinearConstructor(const clang::CXXConstructorDecl* CD,
                              const clang::ASTContext& C) {
       // Trivial constructors are linear
@@ -967,6 +988,19 @@ namespace clad {
 
     bool isCopyable(const clang::CXXRecordDecl* RD) {
       if (RD->defaultedCopyConstructorIsDeleted())
+        return false;
+      // Not copyable if every declared copy ctor is deleted or non-public.
+      // (A type may still be copyable if it has another public copy ctor.)
+      bool sawCopyCtor = false;
+      bool hasUsableCopyCtor = false;
+      for (const clang::CXXConstructorDecl* Ctor : RD->ctors()) {
+        if (!Ctor->isCopyConstructor())
+          continue;
+        sawCopyCtor = true;
+        if (!Ctor->isDeleted() && Ctor->getAccess() == clang::AS_public)
+          hasUsableCopyCtor = true;
+      }
+      if (sawCopyCtor && !hasUsableCopyCtor)
         return false;
       if (RD->hasUserDeclaredCopyConstructor()) {
         std::string qualifiedName = RD->getQualifiedNameAsString();

@@ -322,18 +322,20 @@ double f10(double x){
 // CHECK-NEXT:     }
 // CHECK-NEXT: }
 
+// f10_1 writes one element of t, so the range recorded is one element wide.
 // CHECK-NEXT: void f10_grad(double x, double *_d_x) {
-// CHECK-NEXT:     clad::restore_tracker _tracker0 = {};
+// CHECK-NEXT:     clad::tape<double> _rec0 = {};
 // CHECK-NEXT:     double _d_t[3] = {0};
 // CHECK-NEXT:     double t[3];
-// CHECK-NEXT:     _tracker0.clear();
-// CHECK-NEXT:     f10_1_reverse_forw(x, t, 0., _d_t, _tracker0);
+// CHECK-NEXT:     clad::record_range(_rec0, t, 1UL);
+// CHECK-NEXT:     f10_1(x, t);
 // CHECK-NEXT:     _d_t[0] += 1;
 // CHECK-NEXT:     {
-// CHECK-NEXT:         _tracker0.restore();
+// CHECK-NEXT:         clad::peek_range(_rec0, t, 1UL);
 // CHECK-NEXT:         double _r0 = 0.;
 // CHECK-NEXT:         f10_1_pullback(x, t, &_r0, _d_t);
-// CHECK-NEXT:         _tracker0.restore();
+// CHECK-NEXT:         clad::peek_range(_rec0, t, 1UL);
+// CHECK-NEXT:         clad::drop_range(_rec0, 1UL);
 // CHECK-NEXT:         *_d_x += _r0;
 // CHECK-NEXT:     }
 // CHECK-NEXT: }
@@ -586,6 +588,26 @@ double f14(double x){
   printf("{%.2f, %.2f}\n", result[0], result[1]); \
 }
 
+// A function passed as an argument is a reference to something that is not a
+// variable, so it has no varied state of its own.
+int pick(double k) { return 7; }
+
+double f15_1(double x, int (*f)(double)) { return x * x; }
+
+double f15(double x) { return f15_1(x, pick); }
+
+// CHECK: void f15_grad(double x, double *_d_x) {
+// CHECK-NEXT:     clad::restore_tracker _tracker0 = {};
+// CHECK-NEXT:     _tracker0.clear();
+// CHECK-NEXT:     {
+// CHECK-NEXT:         _tracker0.restore();
+// CHECK-NEXT:         double _r0 = 0.;
+// CHECK-NEXT:         f15_1_pullback(x, pick, 1, &_r0);
+// CHECK-NEXT:         _tracker0.restore();
+// CHECK-NEXT:         *_d_x += _r0;
+// CHECK-NEXT:     }
+// CHECK-NEXT: }
+
 int main(){
     double arr[] = {1,2,3,4,5};
     double darr[] = {0,0,0,0,0};
@@ -611,4 +633,5 @@ int main(){
     grad13.execute(3, arr, &dx, darr);
     printf("{%.2f}\n", dx); // CHECK-EXEC: {0.00}
     TEST1(f14, 3);// CHECK-EXEC: {1.00}
+    TEST1(f15, 3);// CHECK-EXEC: {6.00}
 }
