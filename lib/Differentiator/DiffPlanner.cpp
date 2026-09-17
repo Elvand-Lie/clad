@@ -6,11 +6,14 @@
 #include "TBRAnalyzer.h"
 #include "UsefulAnalyzer.h"
 
+#include "LoopAnalyzer.h"
 #include "clad/Differentiator/CladConfig.h"
+
 #include "clad/Differentiator/CladUtils.h"
 #include "clad/Differentiator/Compatibility.h"
 #include "clad/Differentiator/DerivativeBuilder.h"
 #include "clad/Differentiator/DerivedFnCollector.h"
+#include "clad/Differentiator/ParseDiffArgsTypes.h"
 #include "clad/Differentiator/Timers.h"
 
 #include "clang/AST/ASTContext.h"
@@ -42,16 +45,19 @@
 #include "clang/Sema/SemaDiagnostic.h"
 #include "clang/Sema/TemplateDeduction.h"
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 using namespace clang;
@@ -477,6 +483,49 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
     return F.Found;
   }
 
+  const FunctionLoopFacts& DiffRequest::getLoopFacts() const {
+    // Re-run for another function: a copied request keeps the facts of the one
+    // it was made for, and ProcessDiffRequest re-points a request at the
+    // definition of what it was planned for.
+    if (!m_LoopFacts || m_LoopFacts->Fn != Function) {
+      auto Facts = std::make_shared<FunctionLoopFacts>();
+      Facts->Fn = Function;
+      // Switched off, the facts stay empty, which every reader already has to
+      // handle: it is what a function whose loops prove nothing looks like.
+      if (Function && EnableLoopAnalysis)
+        analyzeLoops(*this, *Facts);
+      m_LoopFacts = std::move(Facts);
+    }
+    return *m_LoopFacts;
+  }
+
+  const LoopFacts& DiffRequest::getLoopFacts(const ForStmt* FS) const {
+    static const LoopFacts None;
+    const auto& Loops = getLoopFacts().Loops;
+    auto it = Loops.find(FS);
+    return it == Loops.end() ? None : it->second;
+  }
+
+  llvm::ArrayRef<WrittenExtent> DiffRequest::getWrittenExtents() const {
+    return getLoopFacts().Extents;
+  }
+
+  bool DiffRequest::writesVariable(const VarDecl* VD) const {
+    // A reference names storage this walk does not follow, and static or
+    // external storage is reachable from inside a callee. Neither can be
+    // ruled out by looking at the body alone.
+    if (VD->getType()->isReferenceType() || !VD->hasLocalStorage())
+      return true;
+    const FunctionDecl* Def = Function ? Function->getDefinition() : nullptr;
+    if (!Def || !Def->hasBody())
+      return true;
+    if (!m_WrittenVarInfo.HasAnalysisRun) {
+      utils::collectWrittenVars(Def->getBody(), m_WrittenVarInfo.Written);
+      m_WrittenVarInfo.HasAnalysisRun = true;
+    }
+    return m_WrittenVarInfo.Written.count(VD) != 0;
+  }
+
   namespace {
   /// Propagates "the tangent of this pointer may be null" along the pointer
   /// initializations and assignments of a function body, to a fixpoint. Runs on
@@ -563,6 +612,16 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
       }
     }
     return m_NullTangentInfo.MaybeNullPtrs.count(VD) != 0;
+  }
+
+  DiffRequest DiffRequest::pushforwardRequestForHessian(Sema& semaRef) const {
+    DiffRequest pushforwardRequest = *this;
+    pushforwardRequest.Mode = DiffMode::pushforward;
+    pushforwardRequest.Args = nullptr;
+    pushforwardRequest.CallUpdateRequired = false;
+    pushforwardRequest.UseHessianVectorProducts = false;
+    pushforwardRequest.UpdateDiffParamsInfo(semaRef);
+    return pushforwardRequest;
   }
 
   void DiffRequest::UpdateDiffParamsInfo(Sema& semaRef) {
@@ -909,6 +968,11 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
       return true;
     return getVariedDecls().find(VD) != getVariedDecls().end();
   }
+  bool DiffRequest::shouldHavePushforward(const CallExpr* CE) const {
+    auto found = m_ActivityRunInfo.VariedCalls.find(CE);
+    return found == m_ActivityRunInfo.VariedCalls.end() || found->second;
+  }
+
   bool DiffRequest::isVaried(const Expr* E) const {
     // FIXME: We should consider removing pullback requests from the
     // diff graph.
@@ -918,8 +982,14 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
     public:
       VariedChecker(const DiffRequest& DR) : m_Request(DR) {}
       bool isVariedE(const clang::Expr* E) {
-        auto j = m_Request.getVariedStmt().find(E);
-        if (j != m_Request.getVariedStmt().end())
+        // The call-activity pre-pass also fills the varied set, and its
+        // conservative markings (an argument handed to a non-const pointer
+        // parameter is varied no matter what it is) must only feed
+        // shouldHavePushforward. Without the opt-in analysis, keep answering
+        // from the expression alone, as before the pre-pass existed.
+        if (m_Request.EnableVariedAnalysis &&
+            m_Request.getVariedStmt().find(E) !=
+                m_Request.getVariedStmt().end())
           return true;
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
         return !TraverseStmt(const_cast<clang::Expr*>(E));
@@ -1032,6 +1102,9 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
                                     DiffRequest& request) {
     const AnnotateAttr* A = FD->getAttr<AnnotateAttr>();
     std::string Annotation = A->getAnnotation().str();
+    // Not a per-call option like the others: the loop analysis is selected for
+    // the whole translation unit, and every mode's loops are the same loops.
+    request.EnableLoopAnalysis = ReqOpts.EnableLoopAnalysis;
     if (Annotation == "E") {
       // Error estimation has no options yet.
       request.Mode = DiffMode::reverse;
@@ -1174,6 +1247,65 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
     return false;
   }
 
+  /// Whether \p S contains a call forward mode may skip differentiating: a
+  /// plain call that is not an operator or member call (see
+  /// BaseForwardModeVisitor::VisitCallExpr). Missing one is safe -- the
+  /// visitor then differentiates through everything.
+  static bool hasPushforwardCandidate(const Stmt* S) {
+    llvm::SmallVector<const Stmt*, 32> workList{S};
+    while (!workList.empty()) {
+      const Stmt* cur = workList.pop_back_val();
+      if (!cur)
+        continue;
+      if (isa<CallExpr>(cur) && !isa<CXXOperatorCallExpr>(cur) &&
+          !isa<CXXMemberCallExpr>(cur))
+        return true;
+      for (const Stmt* child : cur->children())
+        workList.push_back(child);
+    }
+    return false;
+  }
+
+  /// Whether the planner has to work out which calls of \p request contribute
+  /// to its derivative: only a forward-mode request differentiates along a
+  /// single known direction, and a body without a candidate call has nothing
+  /// to decide.
+  static bool needsCallActivity(const DiffRequest& request) {
+    return request.Mode == DiffMode::forward && request->isDefined() &&
+           hasPushforwardCandidate(request->getBody());
+  }
+
+  /// Seeds the varied set with the parameters \p request differentiates with
+  /// respect to. A FieldDecl (a functor differentiated w.r.t. a field) cannot
+  /// be seeded; the analyzer covers it by treating everything reached through
+  /// `this` as varied.
+  static void seedVariedDirection(DiffRequest& request) {
+    for (const DiffInputVarInfo& dParam : request.DVI)
+      if (const auto* VD = dyn_cast_or_null<VarDecl>(dParam.param))
+        request.addVariedDecl(VD);
+  }
+
+  /// Runs varied analysis for \p request over \p AnalysisDC, which has to
+  /// describe request.Function.
+  static void runVariedAnalysis(DiffRequest& request,
+                                AnalysisDeclContext* AnalysisDC) {
+    TimedAnalysisRegion R("VA " + request.BaseFunctionName);
+    VariedAnalyzer analyzer(AnalysisDC, request, request.getVariedStmt());
+    analyzer.Analyze();
+  }
+
+  /// Runs varied analysis for one direction of \p request over \p AnalysisDC.
+  /// A hessian reuses one forward request for row after row, so what the
+  /// previous direction concluded is dropped first.
+  static void analyzeDirection(DiffRequest& request,
+                               AnalysisDeclContext* AnalysisDC) {
+    request.resetActivityInfo();
+    if (!AnalysisDC || !needsCallActivity(request))
+      return;
+    seedVariedDirection(request);
+    runVariedAnalysis(request, AnalysisDC);
+  }
+
   static bool allArgumentsAreLiterals(const CallExpr::arg_range& args,
                                       const DiffRequest* request) {
     return std::none_of(args.begin(), args.end(), [&request](const Expr* A) {
@@ -1257,6 +1389,20 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
           }
       return {};
     };
+    // A payload that owns storage -- a clad::tape, say -- has no copy
+    // constructor, so a pullback carrying one must take the carrier by
+    // reference. Whichever form the candidate declares is the one to expect.
+    auto pullbackTakesStateByRef = [](const LookupResult& LR) {
+      for (const NamedDecl* ND : LR)
+        if (const FunctionDecl* FD = ND->getUnderlyingDecl()->getAsFunction())
+          for (const ParmVarDecl* PVD : FD->parameters()) {
+            QualType PT = PVD->getType();
+            if (!utils::GetPullbackStatePayload(PT.getNonReferenceType())
+                     .isNull())
+              return PT->isLValueReferenceType();
+          }
+      return false;
+    };
     QualType stateParam;
     if (R.Mode == DiffMode::reverse_mode_forward_pass)
       stateParam = findStateParam(Found);
@@ -1265,9 +1411,10 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
           LookupPropagator(R.BaseFunctionName + "_reverse_forw"));
     if (!stateParam.isNull())
       if (const auto* FPT = dTy->getAs<FunctionProtoType>()) {
-        // The reverse_forw takes the state by reference (out-param); the
-        // pullback takes it by value.
-        QualType stateArg = R.Mode == DiffMode::reverse_mode_forward_pass
+        // The reverse_forw always takes the state by reference: it is an
+        // out-param it fills during the forward sweep.
+        QualType stateArg = (R.Mode == DiffMode::reverse_mode_forward_pass ||
+                             pullbackTakesStateByRef(Found))
                                 ? C.getLValueReferenceType(stateParam)
                                 : stateParam;
         llvm::SmallVector<QualType, 8> params(FPT->param_types().begin(),
@@ -1367,6 +1514,26 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
       } else if (const auto* CtorExpr = dyn_cast<CXXConstructExpr>(callSite)) {
         fnDecl = CtorExpr->getConstructor();
       }
+      // A synthesized request -- the pushforward of a hessian assembled from
+      // vector products -- carries the clad::hessian call as its context. Its
+      // callee is clad's own template, not the function being differentiated,
+      // and must not anchor the namespace lookup.
+      bool anchorsRequestFn = false;
+      if (const auto* ND = dyn_cast_or_null<NamedDecl>(fnDecl)) {
+        const Decl* underlying = ND->getUnderlyingDecl();
+        if (const auto* FTD = dyn_cast<FunctionTemplateDecl>(underlying))
+          underlying = FTD->getTemplatedDecl();
+        if (const auto* UFD = dyn_cast<FunctionDecl>(underlying)) {
+          const FunctionDecl* pattern =
+              request.Function->getTemplateInstantiationPattern();
+          anchorsRequestFn =
+              UFD->getCanonicalDecl() == request.Function->getCanonicalDecl() ||
+              (pattern &&
+               UFD->getCanonicalDecl() == pattern->getCanonicalDecl());
+        }
+      }
+      if (!anchorsRequestFn)
+        fnDecl = request.Function;
     } else
       fnDecl = request.Function;
     assert(request.Mode != DiffMode::unknown &&
@@ -1461,13 +1628,38 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
       if (ProcessInvocationArgs(m_Sema, endLoc, m_Options, FD, request))
         return true;
 
+      // JacobianDerivedFnTraits always produces a void-returning derivative.
+      // Jacobian outputs are exposed through derivative parameters
+      // corresponding to pointer, reference, or array function arguments.
+      // Reject a non-void primal before graph scheduling, analyses, or
+      // custom derivative lookup.
+      // Invariant: request.CallContext is set to E above, and request.Function
+      // is guaranteed non-null by findTargetFunction.
+      if (request.Mode == DiffMode::jacobian &&
+          !request.Function->getReturnType()->isVoidType()) {
+        const FunctionDecl* PrimalFD = request.Function;
+        utils::diag(
+            m_Sema, DiagnosticsEngine::Error,
+            request.CallContext->getBeginLoc(),
+            "jacobian mode currently requires function %0 to return void; "
+            "provide differentiable outputs through pointer, reference, or "
+            "array parameters")
+            << PrimalFD;
+        SourceLocation NoteLoc =
+            PrimalFD->getReturnTypeSourceRange().getBegin();
+        if (NoteLoc.isInvalid())
+          NoteLoc = PrimalFD->getLocation();
+        utils::diag(m_Sema, DiagnosticsEngine::Note, NoteLoc,
+                    "%0 declared here with return type %1")
+            << PrimalFD << PrimalFD->getReturnType();
+        return true;
+      }
+
       request.Args = E->getArg(1);
       request.UpdateDiffParamsInfo(m_Sema);
-      if (request.Mode == DiffMode::reverse && request.EnableVariedAnalysis) {
-        if (request.Args)
-          for (const auto& dParam : request.DVI)
-            request.addVariedDecl(cast<VarDecl>(dParam.param));
-      }
+      if (request.Mode == DiffMode::reverse && request.EnableVariedAnalysis &&
+          request.Args)
+        seedVariedDirection(request);
 
       if (request.Function->hasAttr<CUDAGlobalAttr>())
         for (size_t i = 0, e = request.Function->getNumParams(); i < e; ++i)
@@ -1490,9 +1682,7 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
         return true;
 
       request.VerboseDiags = false;
-      request.EnableTBRAnalysis = m_TopMostReq->EnableTBRAnalysis;
-      request.EnableVariedAnalysis = m_TopMostReq->EnableVariedAnalysis;
-      request.EnableUsefulAnalysis = m_TopMostReq->EnableUsefulAnalysis;
+      request.inheritAnalysesFrom(*m_TopMostReq);
       request.EmitPortingHints = m_TopMostReq->EmitPortingHints;
       request.EnableErrorEstimation = m_TopMostReq->EnableErrorEstimation;
       request.CallContext = E;
@@ -1679,6 +1869,7 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
       forwPassRequest.Mode = DiffMode::reverse_mode_forward_pass;
       forwPassRequest.CallContext = request.CallContext;
       forwPassRequest.UseRestoreTracker = shouldUseRestoreTracker;
+      forwPassRequest.EnableLoopAnalysis = request.EnableLoopAnalysis;
     }
 
     if (hasNoMemoryInputForPointerOrRefReturn) {
@@ -1712,11 +1903,12 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
               /*AnalysisDeclContextManager=*/nullptr, request.Function,
               Options);
 
-      if (request.EnableVariedAnalysis && request->isDefined()) {
-        TimedAnalysisRegion R("VA " + request.BaseFunctionName);
-        VariedAnalyzer analyzer(AnalysisDC.get(), request,
-                                request.getVariedStmt());
-        analyzer.Analyze();
+      if (needsCallActivity(request)) {
+        seedVariedDirection(request);
+        runVariedAnalysis(request, AnalysisDC.get());
+      } else if (request.EnableVariedAnalysis && request->isDefined()) {
+        // The opt-in analysis; requests it seeds are seeded by the collector.
+        runVariedAnalysis(request, AnalysisDC.get());
       }
 
       if (m_TopMostReq->EnableUsefulAnalysis) {
@@ -1746,6 +1938,45 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
 
       if (request.Mode == DiffMode::hessian ||
           request.Mode == DiffMode::hessian_diagonal) {
+        // A hessian assembled from hessian-vector products needs one
+        // pushforward of the function, whose direction is a run-time
+        // argument. Schedule it here so that it is derived, and not merely
+        // declared, by the time HessianModeVisitor asks for its pullback: a
+        // pullback of a function whose body does not exist yet comes out
+        // empty. The decision is recorded on the request: the visitor
+        // consumes it and does not decide again, so the two sides cannot
+        // disagree.
+        request.UseHessianVectorProducts =
+            request.Mode == DiffMode::hessian &&
+            utils::canUseHessianVectorProducts(request.Function);
+
+        // A pointer parameter outside the requested set would get a null
+        // tangent, which forward mode only reads as zero through a const
+        // pointee. Derive per direction instead, which diagnoses the
+        // dependent non-const pointer rather than dereferencing null at run
+        // time.
+        if (request.UseHessianVectorProducts && request.Args)
+          for (const ParmVarDecl* PVD : request.Function->parameters()) {
+            QualType T = PVD->getType();
+            if (!utils::isArrayOrPointerType(T) ||
+                utils::GetValueType(T).isConstQualified())
+              continue;
+            bool requested = std::any_of(request.DVI.begin(), request.DVI.end(),
+                                         [PVD](const DiffInputVarInfo& dVar) {
+                                           return dVar.param == PVD;
+                                         });
+            if (!requested) {
+              request.UseHessianVectorProducts = false;
+              break;
+            }
+          }
+
+        // Build the per-direction forward requests up front: deriving per
+        // direction consumes them, and the vector-product scheme must first
+        // know that none of them resolves to a custom forward derivative,
+        // which only the per-direction scheme honors.
+        llvm::SmallVector<DiffRequest, 8> forwRequests;
+        bool hasCustomForwardDerivative = false;
         DiffRequest forwRequest = request;
         forwRequest.Mode = DiffMode::forward;
         forwRequest.CallUpdateRequired = false;
@@ -1754,32 +1985,49 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
         for (const auto& dParam : request.DVI) {
           const auto* PVD = cast<ParmVarDecl>(dParam.param);
           auto indexInterval = dParam.paramIndexInterval;
-          if (utils::isArrayOrPointerType(PVD->getType())) {
+          bool perIndex = utils::isArrayOrPointerType(PVD->getType());
+          std::size_t start = perIndex ? indexInterval.Start : 0;
+          std::size_t finish = perIndex ? indexInterval.Finish : 1;
+          for (std::size_t i = start; i < finish; ++i) {
             // FIXME: We shouldn't synthesize Args strings.
-            for (auto i = indexInterval.Start; i < indexInterval.Finish; ++i) {
-              auto independentArgString =
-                  PVD->getNameAsString() + "[" + std::to_string(i) + "]";
-              forwRequest.Args = utils::CreateStringLiteral(
-                  m_Sema.getASTContext(), independentArgString);
-              forwRequest.UpdateDiffParamsInfo(m_Sema);
-              if (!forwRequest.DVI.empty())
-                forwRequest.DVI.back().TotalCapacity = indexInterval.Finish;
-              // The request is reused across directions and the lookup only
-              // writes on success; without this reset a direction with a
-              // custom derivative leaks it into every direction after it.
-              forwRequest.CustomDerivative = nullptr;
-              LookupCustomDerivativeDecl(forwRequest);
-              m_DiffRequestGraph.addNode(forwRequest, /*isSource=*/true);
-            }
-          } else {
+            std::string independentArgString = PVD->getNameAsString();
+            if (perIndex)
+              independentArgString += "[" + std::to_string(i) + "]";
             forwRequest.Args = utils::CreateStringLiteral(
-                m_Sema.getASTContext(), PVD->getNameAsString());
+                m_Sema.getASTContext(), independentArgString);
             forwRequest.UpdateDiffParamsInfo(m_Sema);
+            if (perIndex && !forwRequest.DVI.empty())
+              forwRequest.DVI.back().TotalCapacity = indexInterval.Finish;
+            // Every row of an array parameter seeds the same VarDecl, so the
+            // first row's analysis holds for all of them.
+            if (i == start)
+              analyzeDirection(forwRequest, request.m_AnalysisDC);
+            // The request is reused across directions and the lookup only
+            // writes on success; without this reset a direction with a
+            // custom derivative leaks it into every direction after it.
             forwRequest.CustomDerivative = nullptr;
-            LookupCustomDerivativeDecl(forwRequest);
-            m_DiffRequestGraph.addNode(forwRequest, /*isSource=*/true);
+            hasCustomForwardDerivative |=
+                LookupCustomDerivativeDecl(forwRequest);
+            forwRequests.push_back(forwRequest);
           }
         }
+        if (hasCustomForwardDerivative)
+          request.UseHessianVectorProducts = false;
+
+        if (request.UseHessianVectorProducts) {
+          DiffRequest pushforwardRequest =
+              request.pushforwardRequestForHessian(m_Sema);
+          // A custom pushforward is free to take any shape, and the wrapper
+          // builds its calls by position; derive per direction instead.
+          if (LookupCustomDerivativeDecl(pushforwardRequest))
+            request.UseHessianVectorProducts = false;
+          else
+            m_DiffRequestGraph.addNode(pushforwardRequest, /*isSource=*/true);
+        }
+
+        if (!request.UseHessianVectorProducts)
+          for (DiffRequest& fr : forwRequests)
+            m_DiffRequestGraph.addNode(fr, /*isSource=*/true);
       }
     }
 
@@ -1875,6 +2123,7 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
     forwPassRequest.Mode = DiffMode::reverse_mode_forward_pass;
     forwPassRequest.CallContext = E;
     forwPassRequest.EmitPortingHints = m_TopMostReq->EmitPortingHints;
+    forwPassRequest.EnableLoopAnalysis = m_TopMostReq->EnableLoopAnalysis;
     QualType recordTy = CD->getThisType()->getPointeeType();
     bool elideRevForw =
         utils::constructorReverseForwIsElidable(CD, m_Sema.getASTContext());
@@ -1903,8 +2152,7 @@ static QualType GetDerivedFunctionType(const CallExpr* CE) {
     request.Function = CD;
     request.Mode = DiffMode::pullback;
     request.VerboseDiags = false;
-    request.EnableTBRAnalysis = m_TopMostReq->EnableTBRAnalysis;
-    request.EnableVariedAnalysis = m_TopMostReq->EnableVariedAnalysis;
+    request.inheritAnalysesFrom(*m_TopMostReq);
     request.EmitPortingHints = m_TopMostReq->EmitPortingHints;
 
     for (const auto* paramDecl : CD->parameters())

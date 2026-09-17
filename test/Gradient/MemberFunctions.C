@@ -367,7 +367,7 @@ public:
 
   static double static_mem_fn(double u, double v) { return u + v; }
   
-  // CHECK: static inline void static_mem_fn_grad(double u, double v, double *_d_u, double *_d_v) {
+  // CHECK: static void static_mem_fn_grad(double u, double v, double *_d_u, double *_d_v) {
   // CHECK-NEXT:     {
   // CHECK-NEXT:         *_d_u += 1;
   // CHECK-NEXT:         *_d_v += 1;
@@ -652,14 +652,21 @@ double fn8(double x, double y) {
 
 double fn9(double x, double y) {
   S* s = new S{x, false};
-  return s->getVal();
+  double res = s->getVal();
+  delete s;
+  return res;
 }
 
 // CHECK:  void fn9_grad(double x, double y, double *_d_x, double *_d_y) {
 // CHECK-NEXT:      S *_d_s = new S({0., false});
 // CHECK-NEXT:      S *s = new S({x, false});
-// CHECK-NEXT:      s->getVal_pullback(1, _d_s);
+// CHECK-NEXT:      double _d_res = 0.;
+// CHECK-NEXT:      double res = s->getVal();
+// CHECK-NEXT:      _d_res += 1;
+// CHECK-NEXT:      s->getVal_pullback(_d_res, _d_s);
 // CHECK-NEXT:      *_d_x += *_d_s.val;
+// CHECK-NEXT:      delete s;
+// CHECK-NEXT:      delete _d_s;
 // CHECK-NEXT:  }
 
 // CHECK:  void operator_minus_pullback(const double &x, S _d_y, S *_d_this, double *_d_x) const {
@@ -822,6 +829,14 @@ int main() {
 
   SimpleFunctions sf1(2, 3), sf2(3, 4), sf3(4, 5);
   SimpleFunctions d_sf;
+
+  // A gradient of a member function is itself a member function, so it needs a
+  // base object to be called on. Pass it as the first argument to execute.
+  SimpleFunctions mem_fn_base(2, 3), d_mem_fn_base;
+  double d_mem_i = 0, d_mem_j = 0;
+  d_mem_fn.execute(mem_fn_base, 4, 5, &d_mem_fn_base, &d_mem_i, &d_mem_j);
+  printf("{%.2f, %.2f, %.2f, %.2f}\n", d_mem_i, d_mem_j, d_mem_fn_base.x,
+         d_mem_fn_base.y); //CHECK-EXEC: {10.00, 4.00, 4.00, 4.00}
 
   auto d_fn2 = clad::gradient(fn2);
   d_fn2.execute(sf1, 2, &d_sf, &result[0]);

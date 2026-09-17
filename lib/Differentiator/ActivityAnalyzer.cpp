@@ -1,6 +1,8 @@
 #include "ActivityAnalyzer.h"
 #include "AnalysisBase.h"
 
+#include "clad/Differentiator/CladUtils.h"
+
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/Expr.h"
@@ -10,6 +12,7 @@
 #include "clang/AST/Type.h"
 #include "clang/Basic/LLVM.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
 
@@ -109,6 +112,27 @@ void VariedAnalyzer::AnalyzeCFGBlock(const CFGBlock& block) {
       if (merge(succData.get(), m_BlockData[block.getBlockID()].get()))
         m_CFGQueue.insert(succ->getBlockID());
     }
+  }
+}
+
+void VariedAnalyzer::addVariedDeclWithAliases(const VarDecl* VD) {
+  llvm::SmallVector<const VarDecl*, 4> worklist{VD};
+  // What has been queued already. Two pointers initialised from the same
+  // variable reconverge on it, so a declaration can be reached by more than
+  // one path; admitting each one once is what bounds the walk.
+  llvm::SmallPtrSet<const VarDecl*, 4> seen{VD};
+  while (!worklist.empty()) {
+    const VarDecl* cur = worklist.pop_back_val();
+    m_DiffReq.addVariedDecl(cur);
+    // setIsRequired already walks a REF_TYPE's targets to set their varied
+    // bit; this walks the same edges to reach the request's varied-decl set,
+    // which is what decides whether a declaration is given an adjoint.
+    const VarData* data = getVarDataFromDecl(cur);
+    if (data && data->m_Type == VarData::REF_TYPE)
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
+      for (const VarDecl* target : *data->m_Val.m_RefData)
+        if (target && seen.insert(target).second)
+          worklist.push_back(target);
   }
 }
 
@@ -216,6 +240,19 @@ bool VariedAnalyzer::TraverseCallExpr(CallExpr* CE) {
   bool variedBefore = m_Varied;
   bool hasVariedArg = false;
   FunctionDecl* FD = CE->getDirectCallee();
+  // A call through a function pointer has no declaration to inspect: assume
+  // its arguments and result are varied, and record nothing.
+  if (!FD) {
+    for (Expr* arg : CE->arguments()) {
+      m_Varied = true;
+      m_Marking = true;
+      TraverseStmt(arg);
+      markExpr(arg);
+    }
+    m_Marking = false;
+    m_Varied = true;
+    return false;
+  }
   bool noHiddenParam = (CE->getNumArgs() == FD->getNumParams());
   if (noHiddenParam) {
     MutableArrayRef<ParmVarDecl*> FDparam = FD->parameters();
@@ -247,6 +284,8 @@ bool VariedAnalyzer::TraverseCallExpr(CallExpr* CE) {
       m_Marking = false;
       m_Varied = false;
     }
+    // Forward mode asks this to decide whether the call needs a pushforward.
+    m_DiffReq.recordCallActivity(CE, hasVariedArg);
     m_Varied = hasVariedArg || variedBefore;
   }
   return false;
@@ -319,10 +358,23 @@ bool VariedAnalyzer::TraverseCXXConstructExpr(clang::CXXConstructExpr* CE) {
 bool VariedAnalyzer::TraverseCXXThisExpr(clang::CXXThisExpr* TE) {
   markExpr(TE);
   setVaried(TE);
+  // Report the stored `this` data the way TraverseDeclRefExpr reports a
+  // variable: a member can carry the derivative (`c = x; return sq(c);`)
+  // and must not read as constant.
+  if (VarData* data = getVarDataFromDecl(/*VD=*/nullptr))
+    if (findReq(*data))
+      m_Varied = true;
   return false;
 }
 
 bool VariedAnalyzer::TraverseCXXMemberCallExpr(clang::CXXMemberCallExpr* CE) {
+  if (utils::isCUDABuiltinVariable(
+          CE->getImplicitObjectArgument()->IgnoreParenImpCasts(),
+          m_AnalysisDC->getASTContext())) {
+    m_Varied = false;
+    return false;
+  }
+
   const CXXMethodDecl* Method = CE->getMethodDecl();
   auto params = Method->parameters();
 
@@ -398,11 +450,17 @@ bool VariedAnalyzer::TraverseUnaryOperator(UnaryOperator* UnOp) {
 }
 
 bool VariedAnalyzer::TraverseDeclRefExpr(DeclRefExpr* DRE) {
-  auto* VD = cast<VarDecl>(DRE->getDecl());
+  if (utils::isCUDABuiltinVariable(DRE, m_AnalysisDC->getASTContext()))
+    return false;
+  // A reference to something that is not a variable -- a function passed as an
+  // argument, an enumerator -- carries no varied state of its own.
+  auto* VD = dyn_cast<VarDecl>(DRE->getDecl());
+  if (!VD)
+    return false;
 
   if (m_Varied && m_Marking) {
     setVaried(DRE);
-    m_DiffReq.addVariedDecl(VD);
+    addVariedDeclWithAliases(VD);
     markExpr(DRE);
   } else if (m_Marking)
     setVaried(DRE, false);

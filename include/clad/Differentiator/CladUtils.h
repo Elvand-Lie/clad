@@ -19,6 +19,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <cassert>
+#include <set>
 #include <string>
 
 namespace clang {
@@ -170,6 +171,18 @@ namespace clad {
 
     /// Returns true if `QT` is Array or Pointer Type, otherwise returns false.
     bool isArrayOrPointerType(clang::QualType QT);
+
+    /// \returns whether a hessian of \p FD can be assembled from
+    /// hessian-vector products rather than derived once per direction.
+    ///
+    /// The vector-product wrapper hands the pushforward its tangents and the
+    /// pullback its adjoints by position, so it needs the generated shape of
+    /// one tangent per parameter and nothing else in between. An instance
+    /// method also carries `this` and its adjoint, which the hessian matrix
+    /// has no place for. Both the planner and the hessian visitor ask this,
+    /// so that the derivatives the planner schedules are the ones the visitor
+    /// goes looking for.
+    bool canUseHessianVectorProducts(const clang::FunctionDecl* FD);
 
     /// Returns true if `T` is auto or auto* type, otherwise returns false.
     bool IsAutoOrAutoPtrType(clang::QualType T);
@@ -522,12 +535,34 @@ namespace clad {
     /// variable and replace E's further usage by a reference to that variable
     /// to avoid recomputation.
     bool UsefulToStore(const clang::Expr* E);
+    /// Re-declares \p TND in \p DC, keeping the type as it was written rather
+    /// than what it resolves to. An alias is where portable code picks a
+    /// precision, a width or an index type, so resolving it would pin the copy
+    /// to the answer one platform gave.
+    clang::TypedefNameDecl*
+    BuildTypedefNameDecl(clang::ASTContext& C, clang::DeclContext* DC,
+                         clang::SourceLocation StartLoc,
+                         clang::SourceLocation IdLoc,
+                         const clang::TypedefNameDecl* TND);
     /// Builds a reference to one of Enzyme's activity markers, the globals it
     /// matches by name to decide which arguments are differentiated.
     /// They are declared in EnzymeBuiltins.h, which Differentiator.h
     /// includes.
     clang::Expr* BuildEnzymeActivityMarkerRef(clang::Sema& semaRef,
                                               llvm::StringRef name);
+    /// Returns true if the expression represents a CUDA built-in variable
+    /// like threadIdx, blockIdx, blockDim, or gridDim.
+    bool isCUDABuiltinVariable(const clang::Expr* E,
+                               const clang::ASTContext& Context);
+
+    /// Adds to \p Written every variable \p S may write. "Write" is meant
+    /// broadly, as anything that can change a value: an assignment, an
+    /// increment, a taken address, or a bind to a non-const reference.
+    /// Over-approximates on purpose -- callers ask whether a variable is
+    /// provably left alone, and a name that only might be written is no use
+    /// to them.
+    void collectWrittenVars(clang::Stmt* S,
+                            std::set<const clang::VarDecl*>& Written);
     } // namespace utils
     } // namespace clad
 

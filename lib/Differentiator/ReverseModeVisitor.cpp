@@ -8,6 +8,7 @@
 #include "ASTIntegrity.h"
 #include "ConstantFolder.h"
 
+#include "LoopAnalyzer.h"
 #include "TBRAnalyzer.h"
 #include "clad/Differentiator/DerivativeBuilder.h"
 #include "clad/Differentiator/DiffPlanner.h"
@@ -65,9 +66,11 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <iterator>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -81,6 +84,25 @@ using namespace clang;
 namespace clad {
 
 using AllocCallInfo = DiffRequest::AllocCallInfo;
+
+/// The accumulators of one loop being differentiated.
+///
+/// The loop analysis says which adjoints are sums over the loop. This holds the
+/// variable each sum is kept in while the body is visited, and the adjoint it
+/// is added to once the loop is done.
+struct ReverseModeVisitor::ReductionScope {
+  struct Accumulator {
+    const LoopFacts::AdjointReduction* Fact;
+    VarDecl* Acc;
+    Expr* Target; // the `_d_Base[Index]` the sum is added to
+  };
+  const LoopFacts& Facts;
+  llvm::SmallVector<Accumulator, 2> Accumulators;
+
+  /// The accumulator that stands in for \p Target, an adjoint subscript of
+  /// \p Base, or null when this loop does not sum it.
+  Expr* accumulatorFor(ReverseModeVisitor& V, const Expr* Base, Expr* Target);
+};
 
 Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
   if (E)
@@ -107,11 +129,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
     // call owns its tape reference. A local lvalue is required: the single
     // element is passed as a MultiExprArg, which stores a pointer to it.
     Expr* RefClone = V.CloneNode(Ref);
-    Expr* Call =
-        V.m_Sema
-            .ActOnCallExpr(V.getCurrentScope(), BackDRE, noLoc, RefClone, noLoc)
-            .get();
-    return Call;
+    return V.BuildCallExpr(BackDRE, RefClone);
   }
 
   ReverseModeVisitor::CladTapeResult
@@ -144,15 +162,11 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
                         .BuildDeclarationNameExpr(CSS, Push,
                                                   /*AcceptInvalidDecl=*/false)
                         .get();
-    Expr* PopExpr =
-        m_Sema.ActOnCallExpr(getCurrentScope(), PopDRE, noLoc, TapeRef, noLoc)
-            .get();
+    Expr* PopExpr = BuildCallExpr(PopDRE, TapeRef);
     // pop, push and the returned last-ref each get their own tape DeclRef so
     // the same node is not parented by both the push and pop CallExprs.
     Expr* CallArgs[] = {CloneNode(TapeRef), E};
-    Expr* PushExpr =
-        m_Sema.ActOnCallExpr(getCurrentScope(), PushDRE, noLoc, CallArgs, noLoc)
-            .get();
+    Expr* PushExpr = BuildCallExpr(PushDRE, CallArgs);
 
     if (isInsideOMPBlock)
       MarkDeclThreadPrivate(VD);
@@ -231,7 +245,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
             .ActOnCallExpr(
                 getCurrentScope(),
                 /*Fn=*/UnresolvedLookup,
-                /*LParenLoc=*/noLoc,
+                /*LParenLoc=*/GenLoc(),
                 /*ArgExprs=*/llvm::MutableArrayRef<Expr*>(atomicArgs),
                 /*RParenLoc=*/m_DiffReq->getLocation())
             .get();
@@ -638,11 +652,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
       // shared replacement would land under several parents and violate the
       // single-parent AST invariant, so build one per marker site.
       patchEarlyReturnMarkers([&]() -> Stmt* {
-        Expr* RevCallEarly =
-            m_Sema
-                .ActOnCallExpr(getCurrentScope(), BuildDeclRef(RevVD), noLoc,
-                               {}, noLoc)
-                .get();
+        Expr* RevCallEarly = BuildCallExpr(BuildDeclRef(RevVD), {});
         Stmt* RetStmt = m_Sema
                             .ActOnReturnStmt(noLoc, /*RetValExpr=*/nullptr,
                                              getCurrentScope())
@@ -655,11 +665,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
       // (VisitReturnStmt), so it runs only on fall-through. Follow it with the
       // lambda call; the function's implicit fall-off-end serves as the natural
       // return.
-      Expr* RevCallTail =
-          m_Sema
-              .ActOnCallExpr(getCurrentScope(), BuildDeclRef(RevVD), noLoc, {},
-                             noLoc)
-              .get();
+      Expr* RevCallTail = BuildCallExpr(BuildDeclRef(RevVD), {});
       addToCurrentBlock(RevCallTail, direction::forward);
     }
     for (auto S = initsDiff.rbegin(), S_end = initsDiff.rend(); S != S_end; ++S)
@@ -951,6 +957,8 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
             ->ActBeforeFinalizingVisitBranchSingleStmtInIfVisitStmt();
 
       Stmt* Forward = utils::unwrapIfSingleStmt(endBlock(direction::forward));
+      if (!Forward)
+        Forward = MakeCompoundStmt({});
       Stmt* Reverse = utils::unwrapIfSingleStmt(BranchDiff.getStmt_dx());
       return StmtDiff(Forward, Reverse);
     };
@@ -1234,9 +1242,112 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
             utils::unwrapIfSingleStmt(Reverse)};
   }
 
+  ReverseModeVisitor::CountedLoopCode
+  ReverseModeVisitor::BuildCountedLoop(const LoopFacts& F) {
+    // Nothing is decided here: whether the loop is counted, and whether its
+    // bounds hold still across the sweeps, was settled once for the whole
+    // primal. What is left is building the count, which needs Sema and the
+    // scope this visitor is standing in.
+    CountedLoopCode CL;
+    if (!F || !F.BoundsAreStable)
+      return CL;
+    const VarDecl* indVar = F.IndVar;
+    const Expr* init = F.Init;
+    const Expr* bound = F.Bound;
+    const bool inclusive = F.Inclusive;
+
+    // The count is `bound - init`, one more when the bound is inclusive, and
+    // zero when the loop body never runs. Guarding on the same comparison the
+    // loop itself uses keeps the two in step; without it an empty loop would
+    // wrap the subtraction around and iterate the reverse sweep forever.
+    QualType sizeTy = clad_compat::getSizeType(m_Context);
+    // clang returned llvm::Optional here before 16, and the two spell the
+    // same thing differently.
+    clad_compat::llvm_Optional<llvm::APSInt> initVal =
+        init->getIntegerConstantExpr(m_Context);
+    clad_compat::llvm_Optional<llvm::APSInt> boundVal =
+        bound->getIntegerConstantExpr(m_Context);
+
+    // A loop written with constant bounds -- the common `i < 3` -- has a count
+    // known here, and spelling it out beats emitting arithmetic over literals.
+    // Both are widened to int64_t and subtracted, so each has to leave room
+    // for the difference and for the inclusive bound's extra iteration. Half
+    // the positive range apiece is plenty for a loop count and needs no case
+    // analysis at the ends.
+    static constexpr unsigned MaxCountBits = 62;
+    if (initVal && boundVal && initVal->isNonNegative() &&
+        boundVal->isNonNegative() && initVal->getActiveBits() <= MaxCountBits &&
+        boundVal->getActiveBits() <= MaxCountBits) {
+      int64_t count = static_cast<int64_t>(boundVal->getZExtValue()) -
+                      static_cast<int64_t>(initVal->getZExtValue()) +
+                      (inclusive ? 1 : 0);
+      CL.TripCount = ConstantFolder::synthesizeLiteral(sizeTy, m_Context,
+                                                       count > 0 ? count : 0);
+      int64_t end = static_cast<int64_t>(initVal->getZExtValue()) +
+                    (count > 0 ? count : 0);
+      CL.IndVarEnd =
+          ConstantFolder::synthesizeLiteral(indVar->getType(), m_Context, end);
+      return CL;
+    }
+
+    auto toSize = [&](const Expr* E) {
+      // A cast binds tighter than the arithmetic it may contain, so a compound
+      // operand needs parentheses to print back as what it is.
+      Expr* operand = Clone(E);
+      if (!isa<DeclRefExpr>(operand) && !isa<ParenExpr>(operand) &&
+          !isa<IntegerLiteral>(operand))
+        operand = BuildParens(operand);
+      return m_Sema
+          .BuildCStyleCastExpr(
+              noLoc, m_Context.getTrivialTypeSourceInfo(sizeTy), noLoc, operand)
+          .get();
+    };
+    // Casting both sides before subtracting keeps a negative init exact: the
+    // wrapped values differ by the same amount the originals do.
+    Expr* count = toSize(bound);
+    if (initVal && initVal->isNonNegative() &&
+        initVal->getActiveBits() <= MaxCountBits) {
+      // A constant start folds into the inclusive bound's extra iteration,
+      // rather than emitting the two of them as `- 1 + 1`.
+      int64_t offset =
+          static_cast<int64_t>(initVal->getZExtValue()) - (inclusive ? 1 : 0);
+      if (offset)
+        count = BuildOp(
+            offset > 0 ? BO_Sub : BO_Add, count,
+            ConstantFolder::synthesizeLiteral(
+                sizeTy, m_Context, /*val=*/offset > 0 ? offset : -offset));
+    } else {
+      count = BuildOp(BO_Sub, count, toSize(init));
+      if (inclusive)
+        count = BuildOp(BO_Add, count,
+                        ConstantFolder::synthesizeLiteral(sizeTy, m_Context,
+                                                          /*val=*/1));
+    }
+    auto guard = [&](Expr* ran, Expr* didNot) {
+      Expr* runs =
+          BuildOp(inclusive ? BO_GE : BO_GT, Clone(bound), Clone(init));
+      return m_Sema.ActOnConditionalOp(noLoc, noLoc, runs, ran, didNot).get();
+    };
+    CL.TripCount =
+        guard(BuildParens(count),
+              ConstantFolder::synthesizeLiteral(sizeTy, m_Context, /*val=*/0));
+    // Where the index is left: at the bound, one past it when the bound is
+    // inclusive, and untouched when the loop body never ran.
+    Expr* end = Clone(bound);
+    if (inclusive)
+      end = BuildOp(BO_Add, end,
+                    ConstantFolder::synthesizeLiteral(indVar->getType(),
+                                                      m_Context,
+                                                      /*val=*/1));
+    CL.IndVarEnd = guard(end, Clone(init));
+    return CL;
+  }
+
   StmtDiff ReverseModeVisitor::VisitForStmt(const ForStmt* FS) {
     beginBlock(direction::reverse);
-    LoopCounter loopCounter(*this);
+    const LoopFacts& CLF = m_DiffReq.getLoopFacts(FS);
+    CountedLoopCode CL = BuildCountedLoop(CLF);
+    LoopCounter loopCounter(*this, CL.TripCount);
     ScopeRAII forScope(*this, Scope::DeclScope | Scope::ControlScope |
                                   Scope::BreakScope | Scope::ContinueScope);
     llvm::SaveAndRestore<Expr*> SaveCurrentBreakFlagExpr(
@@ -1245,7 +1356,22 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
     const Stmt* init = FS->getInit();
     if (m_ExternalSource)
       m_ExternalSource->ActBeforeDifferentiatingLoopInitStmt();
-    StmtDiff initResult = init ? DifferentiateSingleStmt(init) : StmtDiff{};
+    // Promoting a loop-local declaration to function scope makes the forward
+    // sweep save whatever the name held before, so that the reverse sweep can
+    // put it back. A loop that declares its own index and whose reverse sets
+    // that index on entry needs neither: the value saved is one no statement
+    // can observe. Only a nested loop saves it at all -- an outermost one is
+    // already at function-body level.
+    bool unsavedIndex = CL.TripCount && CLF.OwnsIndVar && isInsideLoop;
+    StmtDiff initResult;
+    {
+      // Read far below in DifferentiateVarDeclStmt, which nothing else can
+      // hand it to; scoped so it cannot outlive the one statement it is about.
+      llvm::SaveAndRestore<const VarDecl*> SaveUnsaved(m_UnsavedLoopIndex);
+      if (unsavedIndex)
+        m_UnsavedLoopIndex = CLF.IndVar;
+      initResult = init ? DifferentiateSingleStmt(init) : StmtDiff{};
+    }
 
     // Save the isInsideLoop value (we may be inside another loop).
     llvm::SaveAndRestore<bool> SaveIsInsideLoop(isInsideLoop);
@@ -1287,9 +1413,17 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
     }
 
     const Stmt* body = FS->getBody();
-    StmtDiff BodyDiff = DifferentiateLoopBody(
-        body, loopCounter, condVarRes.getStmt_dx(), incDiff.getStmt_dx(),
-        /*isForLoop=*/true, FS->getForLoc());
+    ReductionScope Reductions{CLF, {}};
+    StmtDiff BodyDiff;
+    {
+      // Only this loop's own facts apply inside it: an inner loop the analysis
+      // did not count reduces nothing.
+      llvm::SaveAndRestore<ReductionScope*> SaveReductions(
+          m_Reductions, CLF.IndVar ? &Reductions : nullptr);
+      BodyDiff = DifferentiateLoopBody(
+          body, loopCounter, condVarRes.getStmt_dx(), incDiff.getStmt_dx(),
+          /*isForLoop=*/true, FS->getForLoc());
+    }
 
     /// FIXME: This part in necessary to replace local variables inside loops
     /// with function globals and replace initializations with assignments.
@@ -1376,9 +1510,23 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
           m_Context, BodyDiff.getStmt_dx(), revPassCondStmts));
     }
 
-    Stmt* revInit = loopCounter.getNumRevIterations()
-                        ? BuildDeclStmt(loopCounter.getNumRevIterations())
-                        : nullptr;
+    Stmt* revInit = nullptr;
+    if (loopCounter.getNumRevIterations())
+      revInit = BuildDeclStmt(loopCounter.getNumRevIterations());
+    else if (loopCounter.isRecomputed()) {
+      Expr* revInitExpr = loopCounter.getCounterInit();
+      if (unsavedIndex) {
+        // Seed the index with what the forward loop left in it, so the
+        // per-iteration step-back below walks it to where the loop started.
+        auto it = m_DeclReplacements.find(CLF.IndVar);
+        assert(it != m_DeclReplacements.end() && "index must be remapped");
+        revInitExpr =
+            BuildOp(BO_Comma,
+                    BuildOp(BO_Assign, BuildDeclRef(it->second), CL.IndVarEnd),
+                    revInitExpr);
+      }
+      revInit = revInitExpr;
+    }
     Stmt* Reverse = nullptr;
     if (BodyDiff.getStmt_dx())
       Reverse = new (m_Context)
@@ -1386,7 +1534,15 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
                   CounterDecrement, BodyDiff.getStmt_dx(), noLoc, noLoc, noLoc);
 
     addToCurrentBlock(initResult.getStmt_dx(), direction::reverse);
+    // A reduced adjoint sums in its register across the reverse loop and
+    // reaches memory once after it. The reverse block is assembled back to
+    // front, so the flush goes in first and the declaration last.
+    for (const ReductionScope::Accumulator& A : Reductions.Accumulators)
+      addToCurrentBlock(BuildOp(BO_AddAssign, A.Target, BuildDeclRef(A.Acc)),
+                        direction::reverse);
     addToCurrentBlock(Reverse, direction::reverse);
+    for (const ReductionScope::Accumulator& A : Reductions.Accumulators)
+      addToCurrentBlock(BuildDeclStmt(A.Acc), direction::reverse);
     Reverse = endBlock(direction::reverse);
 
     return {utils::unwrapIfSingleStmt(Forward),
@@ -1413,7 +1569,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
         Clone(SL),
         StringLiteral::Create(m_Context, "", SL->getKind(), SL->isPascal(),
                               utils::getNonConstType(SL->getType(), m_Sema),
-                              utils::GetValidSLoc(m_Sema)));
+                              GenLoc()));
   }
 
   StmtDiff ReverseModeVisitor::VisitCXXNullPtrLiteralExpr(
@@ -1583,8 +1739,8 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
         exprsDiff[i] = getZeroInit(ILE->getInit(i)->getType());
     }
 
-    Expr* clonedILE = m_Sema.ActOnInitList(noLoc, clonedExprs, noLoc).get();
-    Expr* ILEDiff = m_Sema.ActOnInitList(noLoc, exprsDiff, noLoc).get();
+    Expr* clonedILE = BuildInitList(clonedExprs);
+    Expr* ILEDiff = BuildInitList(exprsDiff);
     return StmtDiff(clonedILE, ILEDiff);
   }
 
@@ -1601,6 +1757,27 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
     if (shouldUseCudaAtomicOps(base))
       return BuildCallToCudaAtomicAdd(E, dfdx());
     return BuildOp(BO_AddAssign, E, dfdx());
+  }
+
+  Expr* ReverseModeVisitor::ReductionScope::accumulatorFor(
+      ReverseModeVisitor& V, const Expr* Base, Expr* Target) {
+    // What the sum may be kept in is this end's business: a type `+` accepts,
+    // and not one whose adjoint CUDA would have updated atomically.
+    if (!V.dfdx() || !Target->getType()->isRealType() ||
+        V.shouldUseCudaAtomicOps(Target))
+      return nullptr;
+    const LoopFacts::AdjointReduction* Fact = Facts.reductionFor(Base);
+    if (!Fact)
+      return nullptr;
+    for (const Accumulator& A : Accumulators)
+      if (A.Fact == Fact)
+        return V.BuildDeclRef(A.Acc);
+    // The analysis vouched for every subscript of Base in this body taking the
+    // same index, so the first one met is the one added to.
+    QualType Ty = Target->getType();
+    VarDecl* Acc = V.BuildVarDecl(Ty, "_acc", V.getZeroInit(Ty));
+    Accumulators.push_back({Fact, Acc, V.CloneNode(Target)});
+    return V.BuildDeclRef(Acc);
   }
 
   StmtDiff
@@ -1634,7 +1811,12 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
     result = BuildArraySubscript(target, resultIndices);
     // Create the (target += dfdx) statement. result is also returned as the
     // adjoint below, so clone it for the increment to avoid sharing.
-    if (Expr* add_assign = BuildDiffIncrement(CloneNode(result)))
+    Expr* incTarget = m_Reductions && Indices.size() == 1
+                          ? m_Reductions->accumulatorFor(*this, Base, result)
+                          : nullptr;
+    if (!incTarget)
+      incTarget = CloneNode(result);
+    if (Expr* add_assign = BuildDiffIncrement(incTarget))
       addToCurrentBlock(add_assign, direction::reverse);
     if (m_ExternalSource)
       m_ExternalSource->ActAfterProcessingArraySubscriptExpr(valueForRevSweep);
@@ -2212,16 +2394,17 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
 
     // Build the DiffRequest
     DiffRequest pullbackRequest{};
+    // Named, and given the analyses, whether or not the callee is
+    // differentiated: the call site reads its written extents from this
+    // request further down.
+    pullbackRequest.Function = FD;
+    pullbackRequest.inheritAnalysesFrom(m_DiffReq);
     FunctionDecl* pullbackFD = nullptr;
     if (!nonDiff) {
-      pullbackRequest.Function = FD;
       pullbackRequest.BaseFunctionName =
           clad::utils::ComputeEffectiveFnName(FD);
       pullbackRequest.Mode =
           asGrad ? DiffMode::pullback : DiffMode::pushforward;
-      // Silence diag outputs in nested derivation process.
-      pullbackRequest.EnableTBRAnalysis = m_DiffReq.EnableTBRAnalysis;
-      pullbackRequest.EnableVariedAnalysis = m_DiffReq.EnableVariedAnalysis;
       pullbackRequest.EnableErrorEstimation = m_DiffReq.EnableErrorEstimation;
       // Error estimation only uses forward mode derivatives if they are
       // user-prodived to handle builtin derivatives. We cannot determine which
@@ -2468,7 +2651,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
                 .ActOnCallExpr(
                     getCurrentScope(),
                     /*Fn=*/LambdaCallOpExpr,
-                    /*LParenLoc=*/noLoc,
+                    /*LParenLoc=*/GenLoc(),
                     /*ArgExprs=*/llvm::MutableArrayRef<Expr*>(pullbackCallArgs),
                     /*RParenLoc=*/m_DiffReq->getLocation(), CUDAExecConfig)
                 .get();
@@ -2584,6 +2767,101 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
       return {call, call_dx};
     }
 
+    // Every mutable argument is storage owned by one of this function's own
+    // locals. Their addresses die with this frame, so nothing outlives it to
+    // restore them and the callee's records are never read.
+    bool mutatesOnlyOwnLocals = true;
+    for (std::size_t i = 0, e = FD->getNumParams(); i < e; ++i) {
+      QualType parTy = FD->getParamDecl(i)->getType();
+      bool mayWrite = (parTy->isPointerType() &&
+                       !parTy->getPointeeType().isConstQualified()) ||
+                      (parTy->isLValueReferenceType() &&
+                       !parTy.getNonReferenceType().isConstQualified());
+      if (!mayWrite)
+        continue;
+      std::size_t argIdx = i + static_cast<std::size_t>(isMethodOperatorCall);
+      if (argIdx >= CE->getNumArgs() ||
+          !utils::designatesLocallyOwnedStorage(
+              CE->getArg(argIdx),
+              /*asPointerValue=*/parTy->isPointerType())) {
+        mutatesOnlyOwnLocals = false;
+        break;
+      }
+    }
+    // When those records are the only reason to take the reverse_forw, the
+    // primal does the same work without them. This is the forward sweep of a
+    // reverse_forw, so there is no reverse sweep here to consume anything else
+    // the reverse_forw would produce.
+    bool recordsAreDead =
+        usingRestoreTracker && m_RestoreTracker && mutatesOnlyOwnLocals;
+
+    // Where the extent of every buffer the callee writes is known, recording
+    // those ranges replaces the tracker: one copy per buffer instead of an
+    // address and a scan per element. Only where the tracker's records are the
+    // sole reason to route through the reverse_forw, since the primal is then
+    // equivalent.
+    struct RecordedRange {
+      Expr* Buffer;  // the argument whose range is recorded
+      Expr* Bound;   // how many elements, evaluated at this call site
+      QualType Elem; // what the tape holds
+    };
+    llvm::SmallVector<RecordedRange, 4> recordedRanges;
+    bool useRangeRecords = false;
+    if (usingRestoreTracker && !m_RestoreTracker && hasStoredParams &&
+        !needsForwPass && pullbackStateType.isNull() && !isMethodOperatorCall) {
+      llvm::ArrayRef<WrittenExtent> extents =
+          pullbackRequest.getWrittenExtents();
+      // Empty where the loop analysis did not run, and there is then nothing
+      // to record from: the tracker stays.
+      useRangeRecords = extents.size() == FD->getNumParams();
+      for (std::size_t i = 0, e = FD->getNumParams(); i != e && useRangeRecords;
+           ++i) {
+        const WrittenExtent& W = extents[i];
+        if (W.K == WrittenExtent::Kind::None)
+          continue;
+        QualType parTy = FD->getParamDecl(i)->getType();
+        if (i >= CE->getNumArgs() || !parTy->isPointerType() ||
+            parTy->getPointeeType().isConstQualified()) {
+          useRangeRecords = false;
+          break;
+        }
+        Expr* bound = nullptr;
+        if (W.K == WrittenExtent::Kind::Element && W.Offset == 0) {
+          bound = ConstantFolder::synthesizeLiteral(m_Context.UnsignedLongTy,
+                                                    m_Context, /*val=*/1);
+        } else if (W.K == WrittenExtent::Kind::Range) {
+          if (W.BoundIsParam && W.BoundParamIdx < CE->getNumArgs()) {
+            const Expr* arg = CE->getArg(W.BoundParamIdx);
+            // The extent is spelled out four times below. An argument spelled
+            // as a call would run at each of them, and one whose value changed
+            // in between would leave the record and its replays disagreeing
+            // about how many elements there are. Read it once instead; inside
+            // a loop that tapes it, so each iteration replays its own extent.
+            // A constant needs none of this.
+            if (auto val = arg->getIntegerConstantExpr(m_Context))
+              bound = ConstantFolder::synthesizeLiteral(
+                  m_Context.UnsignedLongTy, m_Context, val->getZExtValue());
+            else
+              bound = GlobalStoreAndRef(Clone(arg), m_Context.UnsignedLongTy,
+                                        "_recn", /*force=*/true);
+          } else if (!W.BoundIsParam)
+            bound = ConstantFolder::synthesizeLiteral(m_Context.UnsignedLongTy,
+                                                      m_Context, W.BoundConst);
+        }
+        if (!bound) {
+          useRangeRecords = false;
+          break;
+        }
+        recordedRanges.push_back(
+            {Clone(CE->getArg(i)), bound,
+             parTy->getPointeeType().getUnqualifiedType()});
+      }
+      // Nothing to record means the tracker was not carrying anything either;
+      // leave that case to the existing paths rather than growing a third.
+      if (recordedRanges.empty())
+        useRangeRecords = false;
+    }
+
     // A reverse_forw that carries pullback_state is mandatory even when clad
     // could otherwise call the primal directly: the pullback consumes state
     // only the reverse_forw produces, so eliding it would leave the carrier
@@ -2594,8 +2872,48 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
     // relies on. The missing slot is filled with a null-pointer or zero
     // literal, which is why this is restricted to calls whose returned
     // ValueAndAdjoint is unused: those bodies only replay the primal.
-    if (calleeFnForwPassFD && (!hasDynamicNonDiffParams || !needsForwPass) &&
-        (hasStoredParams || needsForwPass || !pullbackStateType.isNull())) {
+    // Recording the ranges replaces what the reverse_forw was carrying, so the
+    // primal is enough here too.
+    if (useRangeRecords) {
+      llvm::SmallVector<Stmt*, 4> peeksBefore;
+      llvm::SmallVector<Stmt*, 8> peeksAfter;
+      for (const RecordedRange& R : recordedRanges) {
+        QualType tapeTy = GetCladTapeOfType(R.Elem);
+        Expr* tape =
+            BuildDeclRef(GlobalStoreImpl(tapeTy, "_rec", getZeroInit(tapeTy)));
+        auto call = [&](const char* name, llvm::SmallVector<Expr*, 3> args) {
+          return GetFunctionCall(name, "clad", args);
+        };
+        addToCurrentBlock(
+            call("record_range",
+                 {CloneNode(tape), CloneNode(R.Buffer), CloneNode(R.Bound)}),
+            direction::forward);
+        peeksBefore.push_back(
+            call("peek_range",
+                 {CloneNode(tape), CloneNode(R.Buffer), CloneNode(R.Bound)}));
+        // The pullback's own replay mutates what the first peek put back, so
+        // the pre-call state has to be replayed again before the sweep moves
+        // on to statements that precede this call.
+        peeksAfter.push_back(
+            call("peek_range",
+                 {CloneNode(tape), CloneNode(R.Buffer), CloneNode(R.Bound)}));
+        peeksAfter.push_back(
+            call("drop_range", {CloneNode(tape), CloneNode(R.Bound)}));
+      }
+      Stmts& block = getCurrentBlock(direction::reverse);
+      auto* it = std::begin(block) + insertionPoint;
+      block.insert(it, peeksBefore.begin(), peeksBefore.end());
+      std::size_t postPullback = insertionPoint + peeksBefore.size() +
+                                 PreCallStmts.size() +
+                                 (OverloadedDerivedFn ? 1 : 0);
+      it = std::begin(block) + postPullback;
+      block.insert(it, peeksAfter.begin(), peeksAfter.end());
+    }
+
+    if (!useRangeRecords && calleeFnForwPassFD &&
+        (!hasDynamicNonDiffParams || !needsForwPass) &&
+        ((hasStoredParams && !recordsAreDead) || needsForwPass ||
+         !pullbackStateType.isNull())) {
       if (const auto* CD = dyn_cast<CXXConversionDecl>(FD))
         CallArgs.push_back(
             utils::GetCladTagExpr(m_Sema, CD->getConversionType()));
@@ -2632,26 +2950,9 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
           // one of this reverse_forw's locals: those addresses are dead by
           // the time the caller restores, so a record of them would write
           // into freed memory. Such state is caller-invisible, so a
-          // throwaway tracker is enough.
-          bool mutatesOnlyOwnLocals = true;
-          for (std::size_t i = 0, e = FD->getNumParams(); i < e; ++i) {
-            QualType parTy = FD->getParamDecl(i)->getType();
-            bool mayWrite = (parTy->isPointerType() &&
-                             !parTy->getPointeeType().isConstQualified()) ||
-                            (parTy->isLValueReferenceType() &&
-                             !parTy.getNonReferenceType().isConstQualified());
-            if (!mayWrite)
-              continue;
-            std::size_t argIdx =
-                i + static_cast<std::size_t>(isMethodOperatorCall);
-            if (argIdx >= CE->getNumArgs() ||
-                !utils::designatesLocallyOwnedStorage(
-                    CE->getArg(argIdx),
-                    /*asPointerValue=*/parTy->isPointerType())) {
-              mutatesOnlyOwnLocals = false;
-              break;
-            }
-          }
+          // throwaway tracker is enough. (Reaching here with
+          // mutatesOnlyOwnLocals means the reverse_forw was taken for a
+          // reason other than its records -- see recordsAreDead above.)
           if (mutatesOnlyOwnLocals) {
             if (!m_UnusedRestoreTracker) {
               VarDecl* unusedDecl = GlobalStoreImpl(
@@ -2826,7 +3127,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
         /*IndexTypeQuals*/ 0);
     Expr* zero =
         ConstantFolder::synthesizeLiteral(m_Context.IntTy, m_Context, 0);
-    Expr* init = m_Sema.ActOnInitList(noLoc, {zero}, noLoc).get();
+    Expr* init = BuildInitList({zero});
     auto* VD = BuildVarDecl(GradType, "_grad", init);
 
     NumDiffArgs.push_back(BuildDeclRef(VD));
@@ -3447,9 +3748,10 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
         Expr* derivedL = nullptr;
         Expr* derivedR = nullptr;
         ComputeEffectiveDOperands(Ldiff, Rdiff, derivedL, derivedR);
-        // derivedR is the scalar offset, already used by the forward op above;
-        // clone so the derivative op does not share it.
-        derivedR = CloneNode(derivedR);
+        if (derivedL == Ldiff.getExpr())
+          derivedL = CloneNode(derivedL);
+        if (derivedR == Rdiff.getExpr())
+          derivedR = CloneNode(derivedR);
         if (opCode == BO_Sub)
           derivedR = BuildParens(derivedR);
         return StmtDiff(op, BuildOp(opCode, derivedL, derivedR),
@@ -3460,8 +3762,8 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
         Expr* derivedL = nullptr;
         Expr* derivedR = nullptr;
         ComputeEffectiveDOperands(Ldiff, Rdiff, derivedL, derivedR);
-        // Clone the scalar offset shared with the forward op above.
-        derivedR = CloneNode(derivedR);
+        if (derivedR == Rdiff.getExpr())
+          derivedR = CloneNode(derivedR);
         addToCurrentBlock(BuildOp(opCode, derivedL, derivedR),
                           direction::forward);
         if (opCode == BO_Assign && derivedL && derivedR)
@@ -3562,7 +3864,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
       if (CAT) {
         llvm::SmallVector<Expr*, 2> args(CAT->getSize().getZExtValue(),
                                          dummyInit);
-        dummyInit = m_Sema.ActOnInitList(noLoc, args, noLoc).get();
+        dummyInit = BuildInitList(args);
       }
     }
 
@@ -3849,7 +4151,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
                   BuildArrayAssignment(declRef, init, direction::forward);
             else
               assignment = BuildOp(BO_Assign, declRef, init);
-            if (isInsideLoop) {
+            if (isInsideLoop && VD != m_UnsavedLoopIndex) {
               if (m_DiffReq.shouldBeRecorded(DS)) {
                 auto pushPop = StoreAndRestore(declRef, /*prefix=*/"_t",
                                                /*moveToTape=*/true);
@@ -3878,9 +4180,17 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
           else {
             VarDecl* VDDerived = VDDiff.getDecl_dx();
             declsDiff.push_back(VDDerived);
-            if (Stmt* memsetCall = CheckAndBuildCallToMemset(
-                    BuildDeclRef(VDDerived),
-                    VDDerived->getInit()->IgnoreCasts()))
+            // Without an initializer the adjoint is left for the reverse
+            // sweep to read uninitialized, which is a wrong gradient rather
+            // than a missing one. Refuse instead of answering.
+            if (!VDDerived->getInit())
+              diag(DiagnosticsEngine::Error, VD->getLocation(),
+                   "derivative of the initializer of '%0' is not available; "
+                   "the computed gradient would be incorrect")
+                  << VD->getName();
+            else if (Stmt* memsetCall = CheckAndBuildCallToMemset(
+                         BuildDeclRef(VDDerived),
+                         VDDerived->getInit()->IgnoreCasts()))
               memsetCalls.push_back(memsetCall);
             // Track this pointer's allocation size in bytes so an in-place
             // realloc of it can be undone in the reverse sweep. The shadow is
@@ -3896,6 +4206,13 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
               }
           }
         }
+      } else if (const auto* TND = dyn_cast<TypedefNameDecl>(D)) {
+        // An alias carries no value and so no derivative, but the statements
+        // after it go on naming the type by it. It lands at the top of the
+        // derivative rather than where it stood, because the declarations that
+        // use it are promoted there too, and an alias reads no variable that
+        // would keep it from moving.
+        AddToGlobalBlock(BuildDeclStmt(BuildTypedefNameDecl(TND)));
       } else if (auto* SAD = dyn_cast<StaticAssertDecl>(D)) {
         DeclDiff<StaticAssertDecl> SADDiff = DifferentiateStaticAssertDecl(SAD);
         if (SADDiff.getDecl())
@@ -4559,9 +4876,26 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
                               /*pNeedsUpdate=*/true};
   }
 
-  ReverseModeVisitor::LoopCounter::LoopCounter(ReverseModeVisitor& RMV)
-      : m_RMV(RMV) {
+  ReverseModeVisitor::LoopCounter::LoopCounter(ReverseModeVisitor& RMV,
+                                               Expr* tripCount)
+      : m_RMV(RMV), m_TripCount(tripCount) {
     ASTContext& C = m_RMV.m_Context;
+    if (tripCount) {
+      // The forward sweep never touches this counter, so it needs no reset
+      // and -- unlike a counted one -- no tape when the loop is nested: the
+      // reverse loop assigns it on entry, once per enclosing iteration.
+      VarDecl* VD = m_RMV.BuildGlobalVarDecl(clad_compat::getSizeType(C), "_t");
+      DeclStmt* decl = m_RMV.BuildDeclStmt(VD);
+      // Declare it beside its loop, where a counted one sits. A loop below
+      // function-body level is the exception: the reverse sweep runs in a
+      // sibling block and could not name a declaration left in that one.
+      if (m_RMV.getCurrentScope()->isFunctionScope())
+        m_RMV.addToCurrentBlock(decl, direction::forward);
+      else
+        m_RMV.addToBlock(decl, m_RMV.m_Globals);
+      m_Ref = m_RMV.BuildDeclRef(VD);
+      return;
+    }
     // The counter's reset lives in the forward sweep, which an early return
     // taken before the loop never reaches -- while the master reverse sweep
     // still runs. Zero-init makes the reverse loop a no-op there.
@@ -5061,8 +5395,11 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
     addToCurrentBlock(bodyDiff.getStmt_dx(), direction::reverse);
     bodyDiff = {bodyDiff.getStmt(),
                 utils::unwrapIfSingleStmt(endBlock(direction::reverse))};
-    bodyDiff.updateStmt(utils::PrependAndCreateCompoundStmt(
-        m_Context, bodyDiff.getStmt(), counterIncrement));
+    // Null when the reverse sweep recomputes the iteration count instead of
+    // reading one the forward sweep kept.
+    if (counterIncrement)
+      bodyDiff.updateStmt(utils::PrependAndCreateCompoundStmt(
+          m_Context, bodyDiff.getStmt(), counterIncrement));
     return bodyDiff;
   }
 
@@ -5133,11 +5470,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
     Expr* pushDRE = m_RMV.GetCladTapePushDRE();
     Expr* callArgs[] = {m_RMV.CloneNode(m_ControlFlowTape->Ref),
                         CreateSizeTLiteralExpr(value)};
-    Expr* pushExpr = m_RMV.m_Sema
-                         .ActOnCallExpr(m_RMV.getCurrentScope(), pushDRE, noLoc,
-                                        callArgs, noLoc)
-                         .get();
-    return pushExpr;
+    return m_RMV.BuildCallExpr(pushDRE, callArgs);
   }
 
   void
@@ -5434,6 +5767,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
         pullbackRequest.VerboseDiags = false;
         pullbackRequest.EnableTBRAnalysis = m_DiffReq.EnableTBRAnalysis;
         pullbackRequest.EnableVariedAnalysis = m_DiffReq.EnableVariedAnalysis;
+        pullbackRequest.EnableLoopAnalysis = m_DiffReq.EnableLoopAnalysis;
         for (size_t i = 0, e = CD->getNumParams(); i < e; ++i)
           if (adjointArgs[i])
             pullbackRequest.DVI.push_back(CD->getParamDecl(i));

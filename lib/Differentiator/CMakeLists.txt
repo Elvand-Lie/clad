@@ -52,6 +52,8 @@ llvm_add_library(cladDifferentiator
   DerivedFnInfo.cpp
   DiffPlanner.cpp
   ErrorEstimator.cpp
+  DerivativePrinter.cpp
+  GeneratedCode.cpp
   JacobianModeVisitor.cpp
   HessianModeVisitor.cpp
   MultiplexExternalRMVSource.cpp
@@ -68,6 +70,7 @@ llvm_add_library(cladDifferentiator
   VectorPushForwardModeVisitor.cpp
   Version.cpp
   VisitorBase.cpp
+  LoopAnalyzer.cpp
   ${version_inc}
   )
 

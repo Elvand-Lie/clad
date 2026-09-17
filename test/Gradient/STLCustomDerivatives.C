@@ -33,26 +33,6 @@ namespace clad {
         namespace class_functions {
             ::std::vector<size_t> size_update_stack;
 
-            template <typename T>
-            void resize_reverse_forw(::std::vector<T> *v,
-                        typename ::std::vector<T>::size_type sz,
-                        ::std::vector<T> *d_v,
-                        typename ::std::vector<T>::size_type d_sz) {
-              size_update_stack.push_back(v->size());
-              v->resize(sz);
-              d_v->resize(sz, 0);
-            }
-
-            template <typename T>
-            void resize_pullback(::std::vector<T> *v,
-                                 typename ::std::vector<T>::size_type sz,
-                                 ::std::vector<T> *d_v,
-                                 typename ::std::vector<T>::size_type *d_sz) {
-              size_t prevSz = size_update_stack.back();
-              size_update_stack.pop_back();
-              d_v->resize(prevSz);
-            }
-
             template<typename T>
             void clear_reverse_forw(::std::vector<T> *v, ::std::vector<T> *d_v) {
                 size_update_stack.push_back(v->size());
@@ -605,13 +585,12 @@ int main() {
 // CHECK-NEXT:        {{.*}}fill_reverse_forw(&a, x, &_d_a, *_d_x);
 // CHECK-NEXT:        double _d_res = 0.;
 // CHECK-NEXT:        double res = 0;
-// CHECK-NEXT:        unsigned {{long|int}} _t1 = 0;
+// CHECK-NEXT:        unsigned {{long|int}} _t1;
 // CHECK-NEXT:        for (i = 0; i < a.size(); ++i) {
-// CHECK-NEXT:            _t1++;
 // CHECK-NEXT:            res += a.at(i);
 // CHECK-NEXT:        }
 // CHECK-NEXT:        _d_res += 1;
-// CHECK-NEXT:        for (; _t1; _t1--) {
+// CHECK-NEXT:        for (_t1 = 3{{U|UL|ULL}}; _t1; _t1--) {
 // CHECK-NEXT:            --i;
 // CHECK-NEXT:            {
 // CHECK-NEXT:                double _r_d0 = _d_res;
@@ -731,9 +710,8 @@ int main() {
 // CHECK-NEXT:          size_t i0 = {{0U|0UL|0}};
 // CHECK-NEXT:          {{.*}}vector<double> v;
 // CHECK-NEXT:          {{.*}}vector<double> _d_v;
-// CHECK-NEXT:          {{.*}} _t0 = {{0U|0UL|0}};
+// CHECK-NEXT:          {{.*}} _t0;
 // CHECK-NEXT:          for (i = 0; i < 3; ++i) {
-// CHECK-NEXT:              _t0++;
 // CHECK-NEXT:              {{.*}}push(_t1, v);
 // CHECK-NEXT:              {{.*}}push_back_reverse_forw(&v, x, &_d_v, *_d_x);
 // CHECK-NEXT:          }
@@ -772,7 +750,7 @@ int main() {
 // CHECK-NEXT:                  _d_v.at(i0) += _r_d0;
 // CHECK-NEXT:              }
 // CHECK-NEXT:          }
-// CHECK-NEXT:          for (; _t0; _t0--) {
+// CHECK-NEXT:          for (_t0 = 3{{U|UL|ULL}}; _t0; _t0--) {
 // CHECK-NEXT:              {
 // CHECK-NEXT:                  v = {{.*}}back(_t1);
 // CHECK-NEXT:                  {{.*}}push_back_pullback(&v, x, &_d_v, _d_x);
@@ -863,9 +841,8 @@ int main() {
 // CHECK-NEXT:      clad::tape<{{.*}}value_type> _t4 = {};
 // CHECK-NEXT:      {{.*}}allocator_type alloc;
 // CHECK-NEXT:      {{.*}}allocator_type _d_alloc;
-// CHECK-NEXT:      unsigned {{int|long|long long}} _t0 = 0;
+// CHECK-NEXT:      unsigned {{int|long|long long}} _t0;
 // CHECK-NEXT:      for (i = 0; i < 3; ++i) {
-// CHECK-NEXT:          _t0++;
 // CHECK-NEXT:          clad::push(_t1, std::move(_d_ls));
 // CHECK-NEXT:          clad::push(_t2, std::move(ls)) , ls = {u, v}, alloc;
 // CHECK-NEXT:          _d_ls = {0., 0.}, _d_alloc;
@@ -875,7 +852,7 @@ int main() {
 // CHECK-NEXT:          u = ls[1];
 // CHECK-NEXT:      }
 // CHECK-NEXT:      *_d_u += 1;
-// CHECK-NEXT:      for (; _t0; _t0--) {
+// CHECK-NEXT:      for (_t0 = 3{{U|UL|ULL}}; _t0; _t0--) {
 // CHECK-NEXT:          {
 // CHECK-NEXT:              double _r_d1 = *_d_u;
 // CHECK-NEXT:              *_d_u = 0.;
@@ -968,9 +945,8 @@ int main() {
 // CHECK-NEXT:     std::vector<double> _d_ls{};
 // CHECK-NEXT:     clad::tape<value_type *> _t3 = {};
 // CHECK-NEXT:     clad::tape<value_type> _t4 = {};
-// CHECK-NEXT:     unsigned {{int|long|long long}} _t0 = 0;
+// CHECK-NEXT:     unsigned {{int|long|long long}} _t0;
 // CHECK-NEXT:     for (i = 0; i < 3; ++i) {
-// CHECK-NEXT:         _t0++;
 // CHECK-NEXT:         clad::push(_t1, std::move(_d_ls));
 // CHECK-NEXT:         clad::push(_t2, std::move(ls)) , ls = {{.*{u, v}.*}};
 // CHECK-NEXT:         _d_ls = {{.*}}{0., 0.}{{.*}};
@@ -980,7 +956,7 @@ int main() {
 // CHECK-NEXT:         u = ls[1];
 // CHECK-NEXT:     }
 // CHECK-NEXT:     *_d_u += 1;
-// CHECK-NEXT:     for (; _t0; _t0--) {
+// CHECK-NEXT:     for (_t0 = 3{{U|UL|ULL}}; _t0; _t0--) {
 // CHECK-NEXT:         {
 // CHECK-NEXT:             double _r_d1 = *_d_u;
 // CHECK-NEXT:             *_d_u = 0.;
@@ -1045,20 +1021,18 @@ int main() {
 // CHECK-NEXT:     int _d_id0 = 0;
 // CHECK-NEXT:     int id0 = 0;
 // CHECK-NEXT:     const Session &sess = session[0];
-// CHECK-NEXT:     unsigned {{int|long|long long}} _t0 = 0;
+// CHECK-NEXT:     unsigned {{int|long|long long}} _t0;
 // CHECK-NEXT:     for (id = 0; id < nVals; id++) {
-// CHECK-NEXT:         _t0++;
 // CHECK-NEXT:         sess.arr[id] = tensor_x[id] * tensor_theory_params[0];
 // CHECK-NEXT:     }
 // CHECK-NEXT:     float _d_out = 0.F;
 // CHECK-NEXT:     float out = 0.;
-// CHECK-NEXT:     unsigned {{int|long|long long}} _t1 = 0;
+// CHECK-NEXT:     unsigned {{int|long|long long}} _t1;
 // CHECK-NEXT:     for (id0 = 0; id0 < nVals; id0++) {
-// CHECK-NEXT:         _t1++;
 // CHECK-NEXT:         out += std::exp(-sess.arr[id0]);
 // CHECK-NEXT:     }
 // CHECK-NEXT:     _d_out += 1;
-// CHECK-NEXT:     for (; _t1; _t1--) {
+// CHECK-NEXT:     for (_t1 = 2{{U|UL|ULL}}; _t1; _t1--) {
 // CHECK-NEXT:         id0--;
 // CHECK-NEXT:         {
 // CHECK-NEXT:             float _r_d0 = _d_out;
@@ -1066,7 +1040,7 @@ int main() {
 // CHECK-NEXT:             _r0 += _r_d0 * clad::custom_derivatives::std::exp_pushforward(-sess.arr[id0], 1.F).pushforward;
 // CHECK-NEXT:         }
 // CHECK-NEXT:     }
-// CHECK-NEXT:     for (; _t0; _t0--) {
+// CHECK-NEXT:     for (_t0 = 2{{U|UL|ULL}}; _t0; _t0--) {
 // CHECK-NEXT:         id--;
 // CHECK-NEXT:     }
 // CHECK-NEXT: }
@@ -1078,18 +1052,21 @@ int main() {
 // CHECK-NEXT:     float *const &arr = sess.arr;
 // CHECK-NEXT:     float _d_out = 0.F;
 // CHECK-NEXT:     float out = 0.;
-// CHECK-NEXT:     unsigned {{int|long|long long}} _t0 = 0;
+// CHECK-NEXT:     unsigned {{int|long|long long}} _t0;
 // CHECK-NEXT:     for (id = 0; id < nVals; id++) {
-// CHECK-NEXT:         _t0++;
 // CHECK-NEXT:         out += arr[id] * tensor_theory_params[0];
 // CHECK-NEXT:     }
 // CHECK-NEXT:     _d_out += 1;
-// CHECK-NEXT:     for (; _t0; _t0--) {
-// CHECK-NEXT:         id--;
-// CHECK-NEXT:         {
-// CHECK-NEXT:             float _r_d0 = _d_out;
-// CHECK-NEXT:             _d_tensor_theory_params[0] += arr[id] * _r_d0;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         float _acc0 = 0.F;
+// CHECK-NEXT:         for (_t0 = 2{{U|UL|ULL}}; _t0; _t0--) {
+// CHECK-NEXT:             id--;
+// CHECK-NEXT:             {
+// CHECK-NEXT:                 float _r_d0 = _d_out;
+// CHECK-NEXT:                 _acc0 += arr[id] * _r_d0;
+// CHECK-NEXT:             }
 // CHECK-NEXT:         }
+// CHECK-NEXT:         _d_tensor_theory_params[0] += _acc0;
 // CHECK-NEXT:     }
 // CHECK-NEXT: }
 

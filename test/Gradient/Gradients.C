@@ -659,13 +659,12 @@ float running_sum(float* p, int n) {
 // CHECK: void running_sum_grad(float *p, int n, float *_d_p, int *_d_n) {
 // CHECK-NEXT:     int _d_i = 0;
 // CHECK-NEXT:     int i = 0;
-// CHECK-NEXT:     unsigned {{int|long|long long}} _t0 = 0;
+// CHECK-NEXT:     unsigned {{int|long|long long}} _t0;
 // CHECK-NEXT:     for (i = 1; i < n; i++) {
-// CHECK-NEXT:         _t0++;
 // CHECK-NEXT:         p[i] += p[i - 1];
 // CHECK-NEXT:     }
 // CHECK-NEXT:     _d_p[n - 1] += 1;
-// CHECK-NEXT:     for (; _t0; _t0--) {
+// CHECK-NEXT:     for (_t0 = n > 1 ? ((unsigned {{int|long|long long}})n - 1{{U|UL|ULL}}) : 0{{U|UL|ULL}}; _t0; _t0--) {
 // CHECK-NEXT:         i--;
 // CHECK-NEXT:         {
 // CHECK-NEXT:             float _r_d0 = _d_p[i];
@@ -898,6 +897,30 @@ double fn_empty_if_block(double x) {
 //CHECK-NEXT:    _d_res += 1;
 //CHECK-NEXT:    if (_cond0)
 //CHECK-NEXT:        ;
+//CHECK-NEXT:}
+
+double fn_deleted_if_block(double x) {
+  double* d = nullptr;
+  double res = 0;
+  if (x > 0)
+    delete[] d;
+  return res;
+}
+
+//CHECK:void fn_deleted_if_block_grad(double x, double *_d_x) {
+//CHECK-NEXT:    bool _cond0;
+//CHECK-NEXT:    double *_d_d = nullptr;
+//CHECK-NEXT:    double *d = nullptr;
+//CHECK-NEXT:    double _d_res = 0.;
+//CHECK-NEXT:    double res = 0;
+//CHECK-NEXT:    {
+//CHECK-NEXT:        _cond0 = x > 0;
+//CHECK-NEXT:        if (_cond0) {
+//CHECK-NEXT:        }
+//CHECK-NEXT:    }
+//CHECK-NEXT:    _d_res += 1;
+//CHECK-NEXT:    delete [] d;
+//CHECK-NEXT:    delete [] _d_d;
 //CHECK-NEXT:}
 
 double fn_empty_if_else(double x) {
@@ -1306,6 +1329,9 @@ int main() {
 
   INIT_GRADIENT(fn_empty_if_block);
   TEST_GRADIENT(fn_empty_if_block, /*numOfDerivativeArgs=*/1, 0, &dx); // CHECK-EXEC: 0.00
+
+  INIT_GRADIENT(fn_deleted_if_block);
+  TEST_GRADIENT(fn_deleted_if_block, /*numOfDerivativeArgs=*/1, 0, &dx); // CHECK-EXEC: 0.00
 
   INIT_GRADIENT(fn_empty_if_else);
   TEST_GRADIENT(fn_empty_if_else, /*numOfDerivativeArgs=*/1, 1, &dx); // CHECK-EXEC: 5.00

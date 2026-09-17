@@ -37,23 +37,12 @@ checkout :doc:`Using Clad <user/UsingClad>` and
 
 ----------------------
 
-Clad example use::
+Clad example use:
 
-   #include "clad/Differentiator/Differentiator.h"
-   #include <iostream>
-
-   double f(double x, double y) { return x * y; }
-
-   int main() {
-     auto f_dx = clad::differentiate(f, "x");
-     // computes derivative of 'f' when (x, y) = (3, 4) and prints it.
-     std::cout << f_dx.execute(3, 4) << std::endl; // prints: 4
-     f_dx.dump(); // prints:
-     /* double f_darg0(double x, double y) {
-         double _d_x = 1; double _d_y = 0;
-          return _d_x * y + x * _d_y;
-        } */
-   }
+.. literalinclude:: ../../../test/Documentation/Guide/Overview.cpp
+   :language: cpp
+   :start-after: docs-begin-overview
+   :end-before: docs-end-overview
 
 Features
 -----------
@@ -102,8 +91,38 @@ The User Guide
 Citing Clad
 -------------
 
+If Clad contributed to your work, please cite the paper describing it:
+
+.. code-block:: bibtex
+
+   % 16th International workshop on Advanced Computing and Analysis Techniques
+   % in physics research (ACAT), 1-5 September, 2014, Prague, The Czech Republic
+   @inproceedings{Vassilev_Clad,
+     author = {Vassilev,V. and Vassilev,M. and Penev,A. and Moneta,L. and Ilieva,V.},
+     title = {{Clad -- Automatic Differentiation Using Clang and LLVM}},
+     journal = {Journal of Physics: Conference Series},
+     year = 2015,
+     month = {may},
+     volume = {608},
+     number = {1},
+     pages = {012055},
+     doi = {10.1088/1742-6596/608/1/012055},
+     url = {https://iopscience.iop.org/article/10.1088/1742-6596/608/1/012055/pdf},
+     publisher = {{IOP} Publishing}
+   }
+
 Founders
 ---------
 
+Clad was founded by Vassil Vassilev, as part of his research interests and
+vision. He holds the exclusive copyright and other related rights, described in
+`Copyright.txt <https://github.com/vgvassilev/clad/blob/master/Copyright.txt>`__.
+
 License
 --------
+
+Clad is an open source project, licensed under the GNU Lesser General Public
+License. A module under a different license says so in the ``License.txt`` of
+its own source folder. See
+`License.txt <https://github.com/vgvassilev/clad/blob/master/License.txt>`__
+for the full text.

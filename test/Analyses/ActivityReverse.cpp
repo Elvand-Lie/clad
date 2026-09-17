@@ -278,14 +278,13 @@ double f9(double x, double const *obs)
 // CHECK-NEXT:     clad::tape<double> _t1 = {};
 // CHECK-NEXT:     double _d_res = 0.;
 // CHECK-NEXT:     double res = 0.;
-// CHECK-NEXT:     unsigned {{int|long|long long}} _t0 = 0;
+// CHECK-NEXT:     unsigned {{int|long|long long}} _t0;
 // CHECK-NEXT:     for (loopIdx0 = 0; loopIdx0 < 2; loopIdx0++) {
-// CHECK-NEXT:         _t0++;
 // CHECK-NEXT:         clad::push(_t1, res);
 // CHECK-NEXT:         res += std::lgamma(obs[2 + loopIdx0] + 1) + x;
 // CHECK-NEXT:     }
 // CHECK-NEXT:     _d_res += 1;
-// CHECK-NEXT:     for (; _t0; _t0--) {
+// CHECK-NEXT:     for (_t0 = 2{{U|UL|ULL}}; _t0; _t0--) {
 // CHECK-NEXT:         loopIdx0--;
 // CHECK-NEXT:         {
 // CHECK-NEXT:             res = clad::pop(_t1);
@@ -322,18 +321,20 @@ double f10(double x){
 // CHECK-NEXT:     }
 // CHECK-NEXT: }
 
+// f10_1 writes one element of t, so the range recorded is one element wide.
 // CHECK-NEXT: void f10_grad(double x, double *_d_x) {
-// CHECK-NEXT:     clad::restore_tracker _tracker0 = {};
+// CHECK-NEXT:     clad::tape<double> _rec0 = {};
 // CHECK-NEXT:     double _d_t[3] = {0};
 // CHECK-NEXT:     double t[3];
-// CHECK-NEXT:     _tracker0.clear();
-// CHECK-NEXT:     f10_1_reverse_forw(x, t, 0., _d_t, _tracker0);
+// CHECK-NEXT:     clad::record_range(_rec0, t, 1UL);
+// CHECK-NEXT:     f10_1(x, t);
 // CHECK-NEXT:     _d_t[0] += 1;
 // CHECK-NEXT:     {
-// CHECK-NEXT:         _tracker0.restore();
+// CHECK-NEXT:         clad::peek_range(_rec0, t, 1UL);
 // CHECK-NEXT:         double _r0 = 0.;
 // CHECK-NEXT:         f10_1_pullback(x, t, &_r0, _d_t);
-// CHECK-NEXT:         _tracker0.restore();
+// CHECK-NEXT:         clad::peek_range(_rec0, t, 1UL);
+// CHECK-NEXT:         clad::drop_range(_rec0, 1UL);
 // CHECK-NEXT:         *_d_x += _r0;
 // CHECK-NEXT:     }
 // CHECK-NEXT: }
@@ -586,6 +587,55 @@ double f14(double x){
   printf("{%.2f, %.2f}\n", result[0], result[1]); \
 }
 
+// A function passed as an argument is a reference to something that is not a
+// variable, so it has no varied state of its own.
+int pick(double k) { return 7; }
+
+double f15_1(double x, int (*f)(double)) { return x * x; }
+
+double f15(double x) { return f15_1(x, pick); }
+
+// CHECK: void f15_grad(double x, double *_d_x) {
+// CHECK-NEXT:     clad::restore_tracker _tracker0 = {};
+// CHECK-NEXT:     _tracker0.clear();
+// CHECK-NEXT:     {
+// CHECK-NEXT:         _tracker0.restore();
+// CHECK-NEXT:         double _r0 = 0.;
+// CHECK-NEXT:         f15_1_pullback(x, pick, 1, &_r0);
+// CHECK-NEXT:         _tracker0.restore();
+// CHECK-NEXT:         *_d_x += _r0;
+// CHECK-NEXT:     }
+// CHECK-NEXT: }
+
+// A write reaching a variable through a pointer varies that variable, not
+// only the pointer holding its address. Leaving the pointee passive used to
+// deny it an adjoint, which both crashed the reverse mode on the adjoint's
+// missing initializer and dropped the dependency `return y` carries.
+double f16(double x) {
+  double y = 0;
+  double* p = &y;
+  *p = x * x;
+  return y;
+}
+
+// The same through an array element and one more level of indirection, so a
+// pointee reached transitively is not left behind either.
+double f17(double x) {
+  double y[2] = {0, 0};
+  double* p = &y[1];
+  double** q = &p;
+  **q = x * x * x;
+  return y[1];
+}
+
+// A reference binding takes the same path through the dependency set.
+double f18(double x) {
+  double y = 0;
+  double& r = y;
+  r = x * x;
+  return y;
+}
+
 int main(){
     double arr[] = {1,2,3,4,5};
     double darr[] = {0,0,0,0,0};
@@ -611,4 +661,8 @@ int main(){
     grad13.execute(3, arr, &dx, darr);
     printf("{%.2f}\n", dx); // CHECK-EXEC: {0.00}
     TEST1(f14, 3);// CHECK-EXEC: {1.00}
+    TEST1(f15, 3);// CHECK-EXEC: {6.00}
+    TEST1(f16, 3);// CHECK-EXEC: {6.00}
+    TEST1(f17, 3);// CHECK-EXEC: {27.00}
+    TEST1(f18, 3);// CHECK-EXEC: {6.00}
 }
