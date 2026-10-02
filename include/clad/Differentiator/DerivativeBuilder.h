@@ -54,6 +54,8 @@ namespace clad {
 namespace clad {
 class ErrorEstimationHandler;
 
+class GeneratedCode;
+
 class VisitorBase;
 
 /// RAII handle for a cloned derivative function. cloneFunction opens one
@@ -98,6 +100,7 @@ struct DerivativeAndOverload {
   class VisitorBase;
   /// The main builder class which then uses either ForwardModeVisitor or
   /// ReverseModeVisitor based on the required mode.
+  /// \ingroup pipeline
   class DerivativeBuilder {
   private:
     friend class VisitorBase;
@@ -110,6 +113,8 @@ struct DerivativeAndOverload {
     friend class JacobianModeVisitor;
     friend class ReverseModeForwPassVisitor;
     clang::Sema& m_Sema;
+    /// Distinct locations for the nodes clad builds; see GeneratedCode.
+    std::unique_ptr<GeneratedCode> m_GeneratedCode;
     plugin::CladPlugin& m_CladPlugin;
     clang::ASTContext& m_Context;
     DiffScheduler& m_Scheduler;
@@ -130,6 +135,7 @@ struct DerivativeAndOverload {
     /// overload to be found.
     /// \param[in] CallArgs The call args to be used to resolve to the
     /// correct overload.
+    /// \param[in] S The scope to look the overload up in.
     /// \param[in] callSite - The call expression which triggers the custom
     ///            derivative call.
     /// \param[in] forCustomDerv A flag to keep track of which
@@ -137,6 +143,7 @@ struct DerivativeAndOverload {
     /// \param[in] namespaceShouldExist A flag to enforce assertion failure
     /// if the overload function namespace was not found. If false and
     /// the function containing namespace was not found, nullptr is returned.
+    /// \param[in] CUDAExecConfig The kernel launch configuration, if any.
     ///
     /// \returns The call expression if a suitable function overload was found,
     /// null otherwise.
@@ -179,10 +186,16 @@ struct DerivativeAndOverload {
     DerivativeBuilder(clang::Sema& S, plugin::CladPlugin& P,
                       DiffScheduler& Scheduler);
     ~DerivativeBuilder();
+    /// A location for a node about to be built. Distinct per node, so that a
+    /// line note can later say where that node really ended up.
+    clang::SourceLocation GenLoc();
+    /// Where those locations point, for a caller with generated code to print
+    /// into it.
+    GeneratedCode& getGeneratedCode();
     /// Fuction to set the error diagnostic printing value for numerical
     /// differentiation.
     ///
-    /// \param[in] \c value The new value to be set.
+    /// \param[in] value The new value to be set.
     void setNumDiffErrDiag(bool value) {
       m_PrintNumericalDiffErrorDiag = value;
     }
@@ -195,7 +208,7 @@ struct DerivativeAndOverload {
     ///\brief Produces the derivative of a given function
     /// according to a given plan.
     ///
-    ///\param[in] FD - the function that will be differentiated.
+    ///\param[in] request - what to differentiate, and how.
     ///
     ///\returns The differentiated function and potentially created enclosing
     /// context.
@@ -206,6 +219,10 @@ struct DerivativeAndOverload {
     /// boundary) with no custom derivative, emit a remark naming the expected
     /// custom-derivative signature and the non-differentiable marker.
     void EmitPortingHint(const DiffRequest& request);
+    /// Reports every construct an analysis looked for in \p request's primal
+    /// and did not find, at the primal -- which is where the answer would
+    /// have to change.
+    void emitAnalysisMissRemarks(const DiffRequest& request);
     /// Find the derived function if present in the DerivedFnCollector.
     ///
     /// \param[in] request The request to find the derived function.
@@ -223,15 +240,17 @@ struct DerivativeAndOverload {
 
     /// Handles processing of a diff request when an existing derivative is
     /// being processed.
-    /// \param[in] Request The request to be processed.
+    /// \param[in] request The request to be processed.
     /// \returns The derivative function if found, nullptr otherwise.
     clang::FunctionDecl* HandleNestedDiffRequest(DiffRequest& request);
 
     /// Emits diagnostic messages on differentiation (or lack thereof) for
     /// an function without a definition.
     ///
-    /// \param[in] \c FD - The function declaration.
-    /// \param[in] \c srcLoc Any associated source location information.
+    /// \param[in] FD - The function declaration.
+    /// \param[in] srcLoc Any associated source location information.
+    /// \param[in] numDiffViable whether numerical differentiation could stand
+    /// in for the missing definition.
     void diagnoseUndefinedFunction(const clang::FunctionDecl* FD,
                                    clang::SourceLocation srcLoc,
                                    bool numDiffViable);

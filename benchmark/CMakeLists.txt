@@ -3,6 +3,7 @@ enable_testing()
 
 CB_ADD_GBENCHMARK(Simple Simple.cpp)
 CB_ADD_GBENCHMARK(PullbackState PullbackState.cpp)
+CB_ADD_GBENCHMARK(ReplayFreePullbacks ReplayFreePullbacks.cpp)
 CB_ADD_GBENCHMARK(AlgorithmicComplexity AlgorithmicComplexity.cpp)
 CB_ADD_GBENCHMARK(ArrayExpressionTemplates ArrayExpressionTemplates.cpp)
 if (CLAD_ENABLE_ENZYME_BACKEND)
@@ -41,6 +42,7 @@ target_compile_definitions(tapenade_support PRIVATE
 CB_ADD_GBENCHMARK(VectorModeComparison VectorModeComparison.cpp)
 CB_ADD_GBENCHMARK(MemoryComplexity_tapenade MemoryComplexity.cpp)
 CB_ADD_GBENCHMARK(Multithreading Multithreading.cpp)
+CB_ADD_GBENCHMARK(Tape Tape.cpp)
 CB_ADD_GBENCHMARK(Hessians Hessians.cpp)
 CB_ADD_GBENCHMARK(GPT2Training GPT2Training.cpp)
 

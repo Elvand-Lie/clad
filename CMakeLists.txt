@@ -39,12 +39,12 @@ set(CMAKE_MODULE_PATH
   )
 
 # Define clad supported version of clang and llvm.
-set(CLANG_MIN_SUPPORTED 12.0)
-set(CLANG_MAX_SUPPORTED "22.2.x")
-set(CLANG_VERSION_UPPER_BOUND 22.2.0)
-set(LLVM_MIN_SUPPORTED 12.0)
-set(LLVM_MAX_SUPPORTED "22.2.x")
-set(LLVM_VERSION_UPPER_BOUND 22.2.0)
+set(CLANG_MIN_SUPPORTED 14.0)
+set(CLANG_MAX_SUPPORTED "23.2.x")
+set(CLANG_VERSION_UPPER_BOUND 23.2.0)
+set(LLVM_MIN_SUPPORTED 14.0)
+set(LLVM_MAX_SUPPORTED "23.2.x")
+set(LLVM_VERSION_UPPER_BOUND 23.2.0)
 
 # If we are not building as a part of LLVM, build clad as an
 # standalone project, using LLVM as an external library:
@@ -122,11 +122,13 @@ if( CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR )
   # Emscripten builds of clangInterpreter link lldWasm/lldCommon
   # (clang/lib/Interpreter/CMakeLists.txt), so ClangTargets.cmake references
   # LLD targets and find_package(Clang) fails unless LLD is found first.
+  # Look only in LLD_DIR and next to the LLVM found above: the default paths
+  # include PATH, and the LLD of a clang on PATH loads that compiler's
+  # LLVMConfig.cmake over it.
   if (DEFINED LLD_DIR)
-    find_package(LLD QUIET CONFIG PATHS ${LLD_DIR} "${LLD_DIR}/lib/cmake/lld" "${LLD_DIR}/cmake" NO_DEFAULT_PATH)
-  else()
-    find_package(LLD QUIET CONFIG HINTS "${LLVM_DIR}/../lld" "${LLVM_BINARY_DIR}/lib/cmake/lld")
+    set(lld_search_paths ${LLD_DIR} "${LLD_DIR}/lib/cmake/lld" "${LLD_DIR}/cmake")
   endif()
+  find_package(LLD QUIET CONFIG PATHS ${lld_search_paths} "${LLVM_DIR}/../lld" "${LLVM_BINARY_DIR}/lib/cmake/lld" NO_DEFAULT_PATH)
 
   if (DEFINED CLANG_VERSION)
     message(FATAL_ERROR "Clang's configuration is not versioned. Please set LLVM_VERSION instead.")
@@ -298,6 +300,9 @@ install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/
   FILES_MATCHING
   PATTERN "CMakeFiles" EXCLUDE
   PATTERN "*.inc"
+  # The tables clad's own headers expand are rendered here, so an installed
+  # clad needs them beside the headers that include them.
+  PATTERN "*.def"
   )
 
 install(FILES cmake/modules/AddClad.cmake
@@ -309,6 +314,12 @@ add_definitions( -D_GNU_SOURCE
   -DCLAD_INSTDIR_INCL="${CLAD_BINARY_DIR}/include" )
 
 option(CLAD_BUILD_STATIC_ONLY "Does not build shared libraries. Useful when we have LLVM_ENABLE_PLUGINS=OFF (eg. Win or CYGWIN)" OFF)
+
+if (EMSCRIPTEN)
+  # For the test executables and googletest only; the LLVM-style archive
+  # targets append -fno-exceptions, which emcc >= 4 rejects alongside wasm-EH.
+  set(CLAD_EXTRA_WASM_FLAGS "-fwasm-exceptions" CACHE STRING "Extra flags for wasm")
+endif()
 if (NOT CLAD_BUILD_STATIC_ONLY AND NOT LLVM_ENABLE_PLUGINS)
   message(FATAL_ERROR "LLVM_ENABLE_PLUGINS is set to OFF. Please build clad with -DCLAD_BUILD_STATIC_ONLY=ON.")
 endif()
@@ -322,6 +333,107 @@ if (TARGET clang-headers)
 endif()
 
 include(AddClad)
+
+# Analyses.td and Options.td are where clad's analyses, the constructs they
+# look for, the wording of every report and every option clad takes are
+# written down. Everything rendered from them lands in the build directory and
+# none of it is committed, so what clad compiles is what the .td files say and
+# there is no second copy to go stale. The documentation pages are rendered the
+# same way, by a target readthedocs runs before sphinx.
+#
+# A cross build cannot run a tool it built for the target, so it is given one
+# built for the host: configure utils/clad-tblgen on its own against a native
+# LLVM and pass the result as CLAD_TBLGEN. Without that there is nothing to
+# render with, which is a configure error rather than a header that silently
+# goes stale.
+if (CLAD_TBLGEN)
+  set(CLAD_TBLGEN_EXE ${CLAD_TBLGEN})
+  set(CLAD_TBLGEN_EXE_FOR_LIT ${CLAD_TBLGEN})
+  add_custom_target(clad-tblgen-ready)
+elseif (CMAKE_CROSSCOMPILING)
+  message(FATAL_ERROR
+    "Cross-compiling clad needs a clad-tblgen built for the host: configure "
+    "utils/clad-tblgen against a native LLVM and pass -DCLAD_TBLGEN=<path>.")
+else()
+  add_subdirectory(utils/clad-tblgen)
+  set(CLAD_TBLGEN_EXE $<TARGET_FILE:clad-tblgen>)
+  # lit's site config is written at configure time, so it cannot carry a
+  # generator expression; name where the tool lands. An in-tree build follows
+  # LLVM's runtime directory, a standalone one the value set further up.
+  if (LLVM_RUNTIME_OUTPUT_INTDIR)
+    set(CLAD_TBLGEN_EXE_FOR_LIT ${LLVM_RUNTIME_OUTPUT_INTDIR}/clad-tblgen)
+  else()
+    set(CLAD_TBLGEN_EXE_FOR_LIT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/clad-tblgen)
+  endif()
+  add_custom_target(clad-tblgen-ready DEPENDS clad-tblgen)
+endif()
+
+# Public: clad's own headers expand them, so an installed clad needs them.
+set(CLAD_GEN_INCL ${CMAKE_CURRENT_BINARY_DIR}/include/clad/Differentiator)
+# Private: only the differentiator reads these, and nothing outside should.
+set(CLAD_GEN_LIB ${CMAKE_CURRENT_BINARY_DIR}/lib/Differentiator)
+file(MAKE_DIRECTORY ${CLAD_GEN_INCL} ${CLAD_GEN_LIB})
+
+set(CLAD_OPTIONS_TD ${CMAKE_CURRENT_SOURCE_DIR}/lib/Differentiator/Options.td)
+set(CLAD_ANALYSES_TD ${CMAKE_CURRENT_SOURCE_DIR}/lib/Differentiator/Analyses.td)
+# Where an included .td is looked for, collected the way llvm's own
+# TableGen.cmake collects it: from the include path, one -I each. Spelling it
+# "-I ${LLVM_INCLUDE_DIRS}" is wrong in both directions. Against an LLVM build
+# tree that variable names two directories, and the second is left to be read
+# as a positional argument; in an in-tree build LLVMConfig is never read and it
+# is empty, so the flag swallows the .td that follows it.
+get_directory_property(CLAD_TBLGEN_INCLUDES INCLUDE_DIRECTORIES)
+list(REMOVE_ITEM CLAD_TBLGEN_INCLUDES "")
+list(REMOVE_DUPLICATES CLAD_TBLGEN_INCLUDES)
+list(TRANSFORM CLAD_TBLGEN_INCLUDES PREPEND -I)
+
+# add_custom_command rather than a target: these are inputs to compiling clad,
+# so they have to be built before it and rebuilt when the table changes.
+#
+# Both the target and the tool's own path are named below. The target orders the
+# two; the path is what makes a rebuilt clad-tblgen re-render, because cmake
+# does not carry the file-level dependencies of a custom target through to what
+# depends on it (cmake #15858, which llvm's own TableGen.cmake names for the
+# same reason). Without it a changed generator leaves every table as it was, and
+# clad compiles against output its renderer no longer produces.
+add_custom_command(
+  OUTPUT ${CLAD_GEN_INCL}/Options.def
+  COMMAND ${CLAD_TBLGEN_EXE} -gen-options ${CLAD_TBLGEN_INCLUDES}
+          ${CLAD_OPTIONS_TD} -o ${CLAD_GEN_INCL}/Options.def
+  DEPENDS clad-tblgen-ready ${CLAD_TBLGEN_EXE} ${CLAD_OPTIONS_TD}
+  COMMENT "Rendering what Options.td describes"
+  VERBATIM)
+
+add_custom_command(
+  OUTPUT ${CLAD_GEN_INCL}/Analyses.def ${CLAD_GEN_LIB}/AnalysisDescs.def
+         ${CLAD_GEN_LIB}/Diagnostics.def
+  COMMAND ${CLAD_TBLGEN_EXE} -gen-analyses ${CLAD_ANALYSES_TD}
+          -o ${CLAD_GEN_INCL}/Analyses.def
+  COMMAND ${CLAD_TBLGEN_EXE} -gen-analysis-descs ${CLAD_ANALYSES_TD}
+          -o ${CLAD_GEN_LIB}/AnalysisDescs.def
+  COMMAND ${CLAD_TBLGEN_EXE} -gen-diagnostics ${CLAD_ANALYSES_TD}
+          -o ${CLAD_GEN_LIB}/Diagnostics.def
+  DEPENDS clad-tblgen-ready ${CLAD_TBLGEN_EXE} ${CLAD_ANALYSES_TD}
+  COMMENT "Rendering what Analyses.td describes"
+  VERBATIM)
+
+add_custom_target(clad-tables DEPENDS
+  ${CLAD_GEN_INCL}/Options.def ${CLAD_GEN_INCL}/Analyses.def
+  ${CLAD_GEN_LIB}/AnalysisDescs.def ${CLAD_GEN_LIB}/Diagnostics.def)
+
+# The pages readthedocs builds; not committed either, and rendered only where
+# the documentation is.
+add_custom_target(clad-table-docs
+  COMMAND ${CLAD_TBLGEN_EXE} -gen-options-docs ${CLAD_TBLGEN_INCLUDES}
+          ${CLAD_OPTIONS_TD}
+          -o ${CMAKE_CURRENT_SOURCE_DIR}/docs/userDocs/source/user/Options.rst
+  COMMAND ${CLAD_TBLGEN_EXE} -gen-analyses-docs ${CLAD_ANALYSES_TD}
+          -o ${CMAKE_CURRENT_SOURCE_DIR}/docs/userDocs/source/user/Analyses.rst
+  COMMAND ${CLAD_TBLGEN_EXE} -gen-diagnostics-docs ${CLAD_ANALYSES_TD}
+          -o ${CMAKE_CURRENT_SOURCE_DIR}/docs/userDocs/source/user/Diagnostics.rst
+  DEPENDS clad-tblgen-ready ${CLAD_TBLGEN_EXE} ${CLAD_OPTIONS_TD} ${CLAD_ANALYSES_TD}
+  COMMENT "Rendering the pages the tables describe"
+  VERBATIM)
 
 add_subdirectory(lib)
 add_subdirectory(tools)
@@ -378,6 +490,8 @@ if (NOT CLAD_BUILD_STATIC_ONLY)
     set(CMAKE_CXX_FLAGS ${stored_cxx_flags})
     set(CMAKE_C_FLAGS ${stored_c_flags})
   endif()
+elseif (EMSCRIPTEN AND NOT CLAD_DISABLE_TESTS)
+  add_subdirectory(unittests)
 endif()
 
 # Workaround for MSVS10 to avoid the Dialog Hell

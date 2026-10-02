@@ -8,9 +8,9 @@
 // RUN: %cladclang_cuda -I%S/../../include --cuda-gpu-arch=%cudaarch \
 // RUN:      --cuda-path=%cudapath %cudaldflags -oGradientCuda.out %s
 //
-// RUN: %cudarun ./GradientCuda.out | %filecheck_exec %s
+// RUN: %if cuda-runtime %{ %cudarun ./GradientCuda.out | %filecheck_exec %s %}
 //
-// REQUIRES: cuda-runtime
+// REQUIRES: cuda-compile
 //
 // expected-no-diagnostics
 
@@ -28,16 +28,15 @@ __device__ __host__ double gauss(const double* x, double* p, double sigma, int d
 }
 
 
-// CHECK: __attribute__((device)) __attribute__((host)) inline void gauss_grad_1(const double *x, double *p, double sigma, int dim, double *_d_p) {
+// CHECK: __attribute__((device)) __attribute__((host)) void gauss_grad_1(const double *x, double *p, double sigma, int dim, double *_d_p) {
 //CHECK-NEXT:     double _d_sigma = 0.;
 //CHECK-NEXT:     int _d_dim = 0;
 //CHECK-NEXT:     int _d_i = 0;
 //CHECK-NEXT:     int i = 0;
 //CHECK-NEXT:     double _d_t = 0.;
 //CHECK-NEXT:     double t = 0;
-//CHECK-NEXT:     unsigned long _t0 = 0;
+//CHECK-NEXT:     unsigned long _t0;
 //CHECK-NEXT:     for (i = 0; i < dim; i++) {
-//CHECK-NEXT:         _t0++;
 //CHECK-NEXT:         t += (x[i] - p[i]) * (x[i] - p[i]);
 //CHECK-NEXT:     }
 //CHECK-NEXT:     double _t1 = t;
@@ -68,7 +67,7 @@ __device__ __host__ double gauss(const double* x, double* p, double sigma, int d
 //CHECK-NEXT:         _d_sigma += 2 * _r0 * sigma;
 //CHECK-NEXT:         _d_sigma += 2 * sigma * _r0;
 //CHECK-NEXT:     }
-//CHECK-NEXT:     for (; _t0; _t0--) {
+//CHECK-NEXT:     for (_t0 = dim > 0 ? (unsigned long)dim : 0UL; _t0; _t0--) {
 //CHECK-NEXT:         i--;
 //CHECK-NEXT:         double _r_d0 = _d_t;
 //CHECK-NEXT:         _d_p[i] += -_r_d0 * (x[i] - p[i]);

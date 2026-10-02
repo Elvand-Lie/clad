@@ -42,7 +42,7 @@ void AnalysisBase::addVar(const clang::VarDecl* VD, bool forceInit) {
 }
 
 // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)
-VarData::VarData(QualType QT, bool forceInit) {
+VarData::VarData(clang::QualType QT, bool forceInit) {
   QT = QT.getCanonicalType();
   if ((forceInit && QT->isLValueReferenceType()) || QT->isRValueReferenceType())
     QT = QT->getPointeeType();
@@ -65,7 +65,17 @@ VarData::VarData(QualType QT, bool forceInit) {
     utils::getRecordDeclFields(recordDecl, Fields);
     for (const auto* field : Fields) {
       const auto varType = field->getType();
-      (*newArrMap)[getProfileID(field)] = VarData(varType);
+      if (varType->isLValueReferenceType()) {
+        // A reference field is never rebound by the analysis -- constructor
+        // bodies are not modeled -- so a REF_TYPE's dependency set would stay
+        // empty and drop every bit setIsRequired stores. Keep one bit on the
+        // field itself: whether what it refers to is required.
+        VarData& fieldData = (*newArrMap)[getProfileID(field)];
+        fieldData.m_Type = VarData::FUND_TYPE;
+        fieldData.m_Val.m_FundData = false;
+      } else {
+        (*newArrMap)[getProfileID(field)] = VarData(varType);
+      }
     }
   }
 }
@@ -236,13 +246,17 @@ bool AnalysisBase::findReq(const VarData& varData) {
   return false;
 }
 
-bool AnalysisBase::findReq(const Expr* E) {
+bool AnalysisBase::findReq(const clang::Expr* E) {
   llvm::SmallVector<ProfileID, 2> IDSequence;
   const VarDecl* VD = nullptr;
   if (getIDSequence(E, VD, IDSequence)) {
     VarData* data = getVarDataFromDecl(VD);
-    for (ProfileID& id : IDSequence)
+    for (ProfileID& id : IDSequence) {
+      if (data->m_Type != VarData::ARR_TYPE &&
+          data->m_Type != VarData::OBJ_TYPE)
+        break;
       data = (*data)[id];
+    }
     return findReq(*data);
   }
 
@@ -277,7 +291,7 @@ bool AnalysisBase::merge(VarData& targetData, VarData& mergeData) {
     for (auto& pair : *mergeData.m_Val.m_ArrData) {
       auto it = targetData.m_Val.m_ArrData->find(pair.first);
       if (it == targetData.m_Val.m_ArrData->end())
-        (*targetData.m_Val.m_ArrData)[pair.first] = pair.second.copy();
+        isMod = merge(*targetData[pair.first], pair.second) || isMod;
     }
     return isMod;
   }
@@ -445,8 +459,10 @@ bool AnalysisBase::merge(VarsData* targetData, VarsData* mergeData) {
     if (found) {
       if (merge(*found, *pair.second))
         isModified = true;
-    } else
+    } else {
       (*targetData)[pair.first] = pair.second->copy();
+      isModified = true;
+    }
   }
 
   // For every variable in collected targetData predecessors, search it inside
@@ -464,8 +480,10 @@ bool AnalysisBase::merge(VarsData* targetData, VarsData* mergeData) {
         while (branch) {
           auto it = branch->find(pair.first);
           if (it != branch->end()) {
-            (*targetData)[pair.first] = pair.second->copy();
-            merge((*targetData)[pair.first], it->second);
+            if (targetData->find(pair.first) == targetData->end())
+              (*targetData)[pair.first] = pair.second->copy();
+            isModified =
+                merge((*targetData)[pair.first], it->second) || isModified;
             break;
           }
           branch = branch->m_Prev;

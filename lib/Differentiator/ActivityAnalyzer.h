@@ -28,6 +28,7 @@ namespace clad {
 /// are determined, meaning variables that depend on input parameters
 /// in a differentiable way. That result enables us to remove redundant
 /// statements in the reverse mode, improving generated codes efficiency.
+/// \ingroup analyses
 class VariedAnalyzer : public clang::RecursiveASTVisitor<VariedAnalyzer>,
                        public AnalysisBase {
   bool m_Varied = false;
@@ -37,6 +38,12 @@ class VariedAnalyzer : public clang::RecursiveASTVisitor<VariedAnalyzer>,
   std::set<const clang::Stmt*>& m_ResSet;
   void markExpr(const clang::Stmt* S) { m_ResSet.insert(S); }
   void setVaried(const clang::Expr* E, bool isVaried = true);
+  /// Records \p VD as varied, and with it every declaration \p VD may alias.
+  /// A write reaching a pointer or reference varies what it refers to, not
+  /// only the pointer itself, so the pointee needs an adjoint just as much.
+  /// The alias targets are the ones TraverseDeclStmt recorded in the REF_TYPE
+  /// dependency set, followed transitively for a pointer bound to a pointer.
+  void addVariedDeclWithAliases(const clang::VarDecl* VD);
   void AnalyzeCFGBlock(const clang::CFGBlock& block);
   void TraverseAllStmtInsideBlock(const clang::CFGBlock& block);
 
@@ -55,9 +62,7 @@ public:
   VariedAnalyzer(const VariedAnalyzer&&) = delete;
   VariedAnalyzer& operator=(const VariedAnalyzer&&) = delete;
 
-  /// Runs Varied analysis.
-  /// \param[in] FD Function to run the analysis on.
-  //, std::set<const clang::ParmVarDecl*>& vPVD
+  /// Runs Varied analysis on the function this analyser was built for.
   void Analyze();
   bool TraverseBinaryOperator(clang::BinaryOperator* BinOp);
   bool TraverseCallExpr(clang::CallExpr* CE);

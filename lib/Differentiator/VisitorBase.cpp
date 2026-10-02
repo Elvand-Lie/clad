@@ -68,7 +68,7 @@ namespace clad {
         m_Context,
         Stmts_ref /**/ CLAD_COMPAT_CLANG15_CompoundStmt_Create_ExtraParam2(
             FPOptionsOverride()),
-        utils::GetValidSLoc(m_Sema), utils::GetValidSLoc(m_Sema));
+        GenLoc(), GenLoc());
   }
 
   bool VisitorBase::isUnusedResult(const Expr* E) {
@@ -154,20 +154,25 @@ namespace clad {
     m_Sema.AddInitializerToDecl(VD, Init, DirectInit);
   }
 
-  VarDecl* VisitorBase::BuildVarDecl(QualType Type, IdentifierInfo* Identifier,
-                                     Expr* Init, bool DirectInit,
-                                     TypeSourceInfo* TSI, StorageClass SC) {
+  VarDecl* VisitorBase::BuildVarDecl(clang::QualType Type,
+                                     clang::IdentifierInfo* Identifier,
+                                     clang::Expr* Init, bool DirectInit,
+                                     clang::TypeSourceInfo* TSI,
+                                     clang::StorageClass SC) {
     return BuildVarDecl(Type, Identifier, getCurrentScope(), Init, DirectInit,
                         TSI, SC);
   }
-  VarDecl* VisitorBase::BuildVarDecl(QualType Type, IdentifierInfo* Identifier,
-                                     Scope* Scope, Expr* Init, bool DirectInit,
-                                     TypeSourceInfo* TSI, StorageClass SC) {
+  VarDecl* VisitorBase::BuildVarDecl(clang::QualType Type,
+                                     clang::IdentifierInfo* Identifier,
+                                     clang::Scope* Scope, clang::Expr* Init,
+                                     bool DirectInit,
+                                     clang::TypeSourceInfo* TSI,
+                                     clang::StorageClass SC) {
     // add namespace specifier in variable declaration if needed.
     Type = utils::AddNamespaceSpecifier(m_Sema, m_Context, Type);
-    auto* VD =
-        VarDecl::Create(m_Context, m_Sema.CurContext, m_DiffReq->getLocation(),
-                        m_DiffReq->getLocation(), Identifier, Type, TSI, SC);
+    SourceLocation Loc = GenLoc();
+    auto* VD = VarDecl::Create(m_Context, m_Sema.CurContext, Loc, Loc,
+                               Identifier, Type, TSI, SC);
 
     SetDeclInit(VD, Init, DirectInit);
     m_Sema.FinalizeDeclaration(VD);
@@ -176,15 +181,28 @@ namespace clad {
     return VD;
   }
 
+  TypedefNameDecl*
+  VisitorBase::BuildTypedefNameDecl(const TypedefNameDecl* TND) {
+    SourceLocation Loc = GenLoc();
+    TypedefNameDecl* Clone = utils::BuildTypedefNameDecl(
+        m_Context, m_Sema.CurContext, Loc, Loc, TND);
+    // The derivative's own statements look the name up, so registering it is
+    // what makes the alias usable rather than merely present.
+    m_Sema.PushOnScopeChains(Clone, getCurrentScope());
+    return Clone;
+  }
+
   void VisitorBase::updateReferencesOf(Stmt* InSubtree) {
     utils::ReferencesUpdater up(m_Sema, getCurrentScope(), m_DiffReq.Function,
                                 m_DeclReplacements);
     up.TraverseStmt(InSubtree);
   }
 
-  VarDecl* VisitorBase::BuildVarDecl(QualType Type, llvm::StringRef prefix,
-                                     Expr* Init, bool DirectInit,
-                                     TypeSourceInfo* TSI, StorageClass SC) {
+  VarDecl* VisitorBase::BuildVarDecl(clang::QualType Type,
+                                     llvm::StringRef prefix, clang::Expr* Init,
+                                     bool DirectInit,
+                                     clang::TypeSourceInfo* TSI,
+                                     clang::StorageClass SC) {
     return BuildVarDecl(Type, CreateUniqueIdentifier(prefix), Init, DirectInit,
                         TSI, SC);
   }
@@ -270,7 +288,7 @@ namespace clad {
     }
   }
 
-  DeclStmt* VisitorBase::BuildDeclStmt(Decl* D) {
+  DeclStmt* VisitorBase::BuildDeclStmt(clang::Decl* D) {
     Stmt* DS = m_Sema
                    .ActOnDeclStmt(m_Sema.ConvertDeclToDeclGroup(D),
                                   D->getBeginLoc(), D->getEndLoc())
@@ -278,7 +296,8 @@ namespace clad {
     return cast<DeclStmt>(DS);
   }
 
-  DeclStmt* VisitorBase::BuildDeclStmt(llvm::MutableArrayRef<Decl*> Decls) {
+  DeclStmt*
+  VisitorBase::BuildDeclStmt(llvm::MutableArrayRef<clang::Decl*> Decls) {
     auto DGR = DeclGroupRef::Create(m_Context, Decls.data(), Decls.size());
     return new (m_Context) DeclStmt(DGR, noLoc, noLoc);
   }
@@ -298,7 +317,6 @@ namespace clad {
                                          clad_compat::NestedNameSpecifierTy NNS,
                                          ExprValueKind VK /*=VK_LValue*/) {
     CXXScopeSpec CSS;
-    SourceLocation fakeLoc = utils::GetValidSLoc(m_Sema);
 
     // A local variable or parameter is never name-qualified: `NS::local` does
     // not exist. Building a qualifier for one is not only meaningless printing
@@ -339,11 +357,11 @@ namespace clad {
     // (the trivial-scope wraps it as Global); skip when there's no
     // qualifier so local-variable refs print bare.
     if (clad_compat::hasQualifier(NNS))
-      CSS.MakeTrivial(m_Context, NNS, fakeLoc);
+      CSS.MakeTrivial(m_Context, NNS, GenLoc());
     QualType T = D->getType();
     T = T.getNonReferenceType();
     return cast<DeclRefExpr>(clad_compat::GetResult<Expr*>(
-        m_Sema.BuildDeclRefExpr(D, T, VK, D->getBeginLoc(), &CSS)));
+        m_Sema.BuildDeclRefExpr(D, T, VK, GenLoc(), &CSS)));
   }
 
   void VisitorBase::LambdaCaptures::collect(llvm::ArrayRef<Stmt*> Body) {
@@ -351,6 +369,8 @@ namespace clad {
     public:
       llvm::SmallSetVector<VarDecl*, 16> Referenced;
       llvm::SmallPtrSet<VarDecl*, 16> Declared;
+      // Both forms of an initializer list, as resolve() walks them.
+      bool shouldVisitImplicitCode() const { return true; }
       bool VisitDeclRefExpr(DeclRefExpr* DRE) {
         if (auto* VD = dyn_cast<VarDecl>(DRE->getDecl()))
           if (VD->isLocalVarDecl() || isa<ParmVarDecl>(VD))
@@ -373,28 +393,12 @@ namespace clad {
 
   void VisitorBase::LambdaCaptures::orderCaptureDecls(
       llvm::SmallVectorImpl<Stmt*>& Prefix,
-      llvm::SmallVectorImpl<Stmt*>& Suffix, llvm::ArrayRef<Stmt*> AlreadyLive) {
-    llvm::SmallPtrSet<const VarDecl*, 16> Available;
-    auto note = [&](Stmt* S) {
-      if (auto* DS = dyn_cast_or_null<DeclStmt>(S))
-        for (Decl* D : DS->decls())
-          if (auto* VD = dyn_cast<VarDecl>(D))
-            Available.insert(VD);
-    };
-    for (const ParmVarDecl* P : m_V.m_Derivative->parameters())
-      Available.insert(P);
-    for (Stmt* S : AlreadyLive)
-      note(S);
-    for (Stmt* S : Prefix)
-      note(S);
-
-    // Moving a decl earlier preserves its value only if its initializer yields
-    // the same value there: it may reference only names already live before
-    // the lambda. This checks availability, not that those names are unmutated
-    // in between; it is sound for the decls clad moves -- zero-initialized
-    // adjoints and entry-live seeds, whose operands the forward sweep has not
-    // yet reassigned. A decl reading a value the suffix computes fails the test
-    // and stays put (findUseBeforeDecl catches a captured local left behind).
+      llvm::SmallVectorImpl<Stmt*>& Suffix) {
+    // A decl moves whole only when its initializer reads no local and no
+    // parameter: a zero, a literal, a global. Anything else is computed in
+    // place, because moving it would run it on a path that returns before
+    // it -- past a guard the original put in front of it -- and would read
+    // its operands before the forward sweep has written them.
     auto selfContained = [&](const VarDecl* VD) {
       const Expr* Init = VD->getInit();
       if (!Init)
@@ -402,25 +406,21 @@ namespace clad {
       bool Ok = true;
       class RefChecker : public RecursiveASTVisitor<RefChecker> {
       public:
-        const llvm::SmallPtrSetImpl<const VarDecl*>* Available = nullptr;
         bool* Ok = nullptr;
         bool VisitDeclRefExpr(DeclRefExpr* DRE) const {
           auto* RVD = dyn_cast<VarDecl>(DRE->getDecl());
-          if (RVD && (RVD->isLocalVarDecl() || isa<ParmVarDecl>(RVD)) &&
-              !Available->count(RVD)) {
+          if (RVD && (RVD->isLocalVarDecl() || isa<ParmVarDecl>(RVD))) {
             *Ok = false;
             return false;
           }
           return true;
         }
       } RC;
-      RC.Available = &Available;
       RC.Ok = &Ok;
       // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
       RC.TraverseStmt(const_cast<Expr*>(Init));
       return Ok;
     };
-
     llvm::SmallVector<Stmt*, 16> Remaining;
     for (Stmt* S : Suffix) {
       auto* DS = dyn_cast<DeclStmt>(S);
@@ -474,7 +474,6 @@ namespace clad {
             if (Expr* Zero = m_V.getZeroInit(VD->getType()))
               m_V.SetDeclInit(VD, Zero);
           Prefix.push_back(m_V.BuildDeclStmt(VD));
-          note(Prefix.back());
           continue;
         }
         // Splitting needs a whole-object assignment, which an array type has
@@ -512,10 +511,6 @@ namespace clad {
         m_V.SetDeclInit(VD, Placeholder);
         flushKept();
         Prefix.push_back(m_V.BuildDeclStmt(VD));
-        // Not noted: the hoisted decl only holds a placeholder until the
-        // assignment below runs, so a later decl reading VD (e.g. a
-        // `_t0 = y` snapshot of a split `y`) must go through this same split
-        // path rather than treat the placeholder as the real value.
         Remaining.push_back(m_V.BuildOp(BO_Assign, DeclRef, Init));
       }
       flushKept();
@@ -528,6 +523,11 @@ namespace clad {
     public:
       LambdaCaptures& Caps;
       explicit CapRefRebuilder(LambdaCaptures& Caps) : Caps(Caps) {}
+      // An initializer list has a syntactic and a semantic form, and CodeGen
+      // reads the semantic one, which the visitor skips unless told to visit
+      // implicit code. A reference rebuilt in the syntactic form alone leaves
+      // the emitted one uncaptured.
+      bool shouldVisitImplicitCode() const { return true; }
       bool VisitStmt(Stmt* P) {
         for (Stmt*& Child : P->children()) {
           auto* DRE = dyn_cast_or_null<DeclRefExpr>(Child);
@@ -637,11 +637,12 @@ namespace clad {
     return E;
   }
 
-  Expr* VisitorBase::StoreAndRef(Expr* E, llvm::StringRef prefix,
+  Expr* VisitorBase::StoreAndRef(clang::Expr* E, llvm::StringRef prefix,
                                  bool forceDeclCreation) {
     return StoreAndRef(E, getCurrentBlock(), prefix, forceDeclCreation);
   }
-  Expr* VisitorBase::StoreAndRef(Expr* E, Stmts& block, llvm::StringRef prefix,
+  Expr* VisitorBase::StoreAndRef(clang::Expr* E, Stmts& block,
+                                 llvm::StringRef prefix,
                                  bool forceDeclCreation) {
     assert(E && "cannot infer type from null expression");
     QualType Type = clad_compat::stripPredefinedSugar(E->getType());
@@ -650,8 +651,8 @@ namespace clad {
     return StoreAndRef(E, Type, block, prefix, forceDeclCreation);
   }
 
-  Expr* VisitorBase::StoreAndRef(Expr* E, QualType Type, Stmts& block,
-                                 llvm::StringRef prefix,
+  Expr* VisitorBase::StoreAndRef(clang::Expr* E, clang::QualType Type,
+                                 Stmts& block, llvm::StringRef prefix,
                                  bool forceDeclCreation) {
     if (!forceDeclCreation) {
       // If Expr is simple (i.e. a reference or a literal), there is no point
@@ -670,19 +671,19 @@ namespace clad {
     return BuildDeclRef(Var);
   }
 
-  Stmt* VisitorBase::Clone(const Stmt* S) {
+  Stmt* VisitorBase::Clone(const clang::Stmt* S) {
     Stmt* clonedStmt = m_Builder.m_NodeCloner->Clone(S);
     updateReferencesOf(clonedStmt);
     return clonedStmt;
   }
-  Expr* VisitorBase::Clone(const Expr* E) {
+  Expr* VisitorBase::Clone(const clang::Expr* E) {
     const Stmt* S = E;
     return llvm::cast<Expr>(Clone(S));
   }
-  Expr* VisitorBase::CloneNode(const Expr* E) {
+  Expr* VisitorBase::CloneNode(const clang::Expr* E) {
     return E ? m_Builder.m_NodeCloner->Clone(E) : nullptr;
   }
-  Stmt* VisitorBase::CloneNode(const Stmt* S) {
+  Stmt* VisitorBase::CloneNode(const clang::Stmt* S) {
     return S ? m_Builder.m_NodeCloner->Clone(S) : nullptr;
   }
 
@@ -704,8 +705,8 @@ namespace clad {
     up.updateType(clonedType);
     return clonedType;
   }
-  Expr* VisitorBase::BuildOp(UnaryOperatorKind OpCode, Expr* E,
-                             SourceLocation OpLoc) {
+  Expr* VisitorBase::BuildOp(clang::UnaryOperatorKind OpCode, clang::Expr* E,
+                             clang::SourceLocation OpLoc) {
     if (!E)
       return nullptr;
     // Don't generate unary operators that cancel out, e.g. `&*x`.
@@ -718,7 +719,7 @@ namespace clad {
     }
     // Debug clang requires the location to be valid
     if (!OpLoc.isValid())
-      OpLoc = utils::GetValidSLoc(m_Sema);
+      OpLoc = GenLoc();
     // Call function for UnaryMinus
     if (OpCode == UO_Minus)
       return ResolveUnaryMinus(E->IgnoreCasts(), OpLoc);
@@ -739,13 +740,13 @@ namespace clad {
     return m_Sema.BuildUnaryOp(nullptr, OpLoc, clang::UO_Minus, E).get();
   }
 
-  Expr* VisitorBase::BuildOp(clang::BinaryOperatorKind OpCode, Expr* L, Expr* R,
-                             SourceLocation OpLoc) {
+  Expr* VisitorBase::BuildOp(clang::BinaryOperatorKind OpCode, clang::Expr* L,
+                             clang::Expr* R, clang::SourceLocation OpLoc) {
     if (!L || !R)
       return nullptr;
     // Debug clang requires the location to be valid
     if (!OpLoc.isValid())
-      OpLoc = utils::GetValidSLoc(m_Sema);
+      OpLoc = GenLoc();
     return m_Sema.BuildBinOp(nullptr, OpLoc, OpCode, L, R).get();
   }
 
@@ -786,12 +787,11 @@ namespace clad {
   }
 
   Expr* VisitorBase::BuildArraySubscript(
-      Expr* Base, const llvm::SmallVectorImpl<clang::Expr*>& Indices) {
+      clang::Expr* Base, const llvm::SmallVectorImpl<clang::Expr*>& Indices) {
     Expr* result = Base;
-    SourceLocation fakeLoc = utils::GetValidSLoc(m_Sema);
     for (Expr* I : Indices)
       result =
-          m_Sema.CreateBuiltinArraySubscriptExpr(result, fakeLoc, I, fakeLoc)
+          m_Sema.CreateBuiltinArraySubscriptExpr(result, GenLoc(), I, GenLoc())
               .get();
     return result;
   }
@@ -811,18 +811,8 @@ namespace clad {
     return utils::LookupTemplateDeclInCladNamespace(m_Sema, "tape");
   }
 
-  LookupResult VisitorBase::tryLookupCladMethod(llvm::StringRef name) {
-    NamespaceDecl* CladNS = utils::GetCladNamespace(m_Sema);
-    CXXScopeSpec CSS;
-    CSS.Extend(m_Context, CladNS, noLoc, noLoc);
-    DeclarationName Name = &m_Context.Idents.get(name);
-    LookupResult R(m_Sema, Name, noLoc, Sema::LookupOrdinaryName);
-    m_Sema.LookupQualifiedName(R, CladNS, CSS);
-    return R;
-  }
-
   LookupResult VisitorBase::LookupCladTapeMethod(llvm::StringRef name) {
-    LookupResult R = tryLookupCladMethod(name);
+    LookupResult R = utils::tryLookupCladMethod(m_Sema, name);
     assert(!R.empty() && isa<FunctionTemplateDecl>(R.getRepresentativeDecl()) &&
            "cannot find requested name");
     return R;
@@ -833,6 +823,25 @@ namespace clad {
     if (!Result)
       Result = LookupCladTapeMethod("push");
     return clad_compat::llvm_Optional_GetValue(Result);
+  }
+
+  Expr* VisitorBase::BuildInitList(llvm::MutableArrayRef<Expr*> Elements) {
+    // A location each, not one for both: the two braces are distinct positions
+    // in the printed derivative, and one location for both would make a range
+    // whose ends coincide.
+    SourceLocation LBrace = GenLoc();
+    SourceLocation RBrace = GenLoc();
+    return m_Sema.ActOnInitList(LBrace, Elements, RBrace).get();
+  }
+
+  Expr* VisitorBase::BuildCallExpr(Expr* Callee,
+                                   llvm::MutableArrayRef<Expr*> Args) {
+    // A location each, for the same reason as the braces above.
+    SourceLocation LParen = GenLoc();
+    SourceLocation RParen = GenLoc();
+    ExprResult Call =
+        m_Sema.ActOnCallExpr(getCurrentScope(), Callee, LParen, Args, RParen);
+    return Call.isInvalid() ? nullptr : Call.get();
   }
 
   Expr* VisitorBase::GetFunctionCall(const std::string& funcName,
@@ -891,20 +900,20 @@ namespace clad {
     return utils::InstantiateTemplate(m_Sema, GetCladTapeDecl(), {T});
   }
 
-  Expr* VisitorBase::BuildCallExprToMemFn(Expr* Base,
-                                          StringRef MemberFunctionName,
-                                          MutableArrayRef<Expr*> ArgExprs,
-                                          SourceLocation Loc /*=noLoc*/) {
+  Expr* VisitorBase::BuildCallExprToMemFn(
+      clang::Expr* Base, llvm::StringRef MemberFunctionName,
+      llvm::MutableArrayRef<clang::Expr*> ArgExprs,
+      clang::SourceLocation Loc /*=noLoc*/) {
     IdentifierInfo* II = &m_Context.Idents.get(MemberFunctionName);
     UnqualifiedId Member;
     Member.setIdentifier(II, Loc);
     return BuildCallExprToMemFn(Base, &Member, ArgExprs, Loc);
   }
 
-  Expr* VisitorBase::BuildCallExprToMemFn(Expr* Base,
-                                          UnqualifiedId* MemberFunction,
-                                          MutableArrayRef<Expr*> ArgExprs,
-                                          SourceLocation Loc /*=noLoc*/) {
+  Expr* VisitorBase::BuildCallExprToMemFn(
+      clang::Expr* Base, clang::UnqualifiedId* MemberFunction,
+      llvm::MutableArrayRef<clang::Expr*> ArgExprs,
+      clang::SourceLocation Loc /*=noLoc*/) {
     if (Loc.isInvalid())
       Loc = m_DiffReq->getLocation();
     CXXScopeSpec SS;
@@ -934,7 +943,7 @@ namespace clad {
 
   Expr* VisitorBase::BuildCallExprToMemFn(
       clang::CXXMethodDecl* FD, llvm::MutableArrayRef<clang::Expr*> argExprs,
-      bool useRefQualifiedThisObj, SourceLocation Loc /*=noLoc*/) {
+      bool useRefQualifiedThisObj, clang::SourceLocation Loc /*=noLoc*/) {
     QualType ThisTy = FD->getThisType();
     Expr* thisExpr = m_Sema.BuildCXXThisExpr(Loc, ThisTy, /*IsImplicit=*/true);
     bool isArrow = true;
@@ -1014,7 +1023,7 @@ namespace clad {
                  .ActOnCallExpr(
                      getCurrentScope(),
                      /*Fn=*/exprFunc,
-                     /*LParenLoc=*/noLoc,
+                     /*LParenLoc=*/GenLoc(),
                      /*ArgExprs=*/llvm::MutableArrayRef<Expr*>(argExprs),
                      /*RParenLoc=*/m_DiffReq->getLocation(), CUDAExecConfig)
                  .get();
@@ -1022,10 +1031,27 @@ namespace clad {
     return call;
   }
 
+  SourceLocation VisitorBase::GenLoc() { return m_Builder.GenLoc(); }
+
+  Stmt* VisitorBase::BuildReturnStmt(Expr* E) {
+    return m_Sema.ActOnReturnStmt(GenLoc(), E, getCurrentScope()).get();
+  }
+
+  Expr* VisitorBase::BuildFunctionalCast(TypeSourceInfo* TSI, QualType T,
+                                         Expr* E) {
+    // One location per parenthesis: they are separate tokens.
+    return m_Sema.BuildCXXFunctionalCastExpr(TSI, T, GenLoc(), E, GenLoc())
+        .get();
+  }
+
+  Expr* VisitorBase::BuildCStyleCast(TypeSourceInfo* TSI, Expr* E) {
+    return m_Sema.BuildCStyleCastExpr(GenLoc(), TSI, GenLoc(), E).get();
+  }
+
   Expr* VisitorBase::BuildCallExprToCladFunction(
       llvm::StringRef name, llvm::MutableArrayRef<clang::Expr*> argExprs,
-      llvm::ArrayRef<clang::TemplateArgument> templateArgs,
-      SourceLocation loc) {
+      llvm::ArrayRef<clang::TemplateArgument> templateArgs) {
+    const SourceLocation loc = GenLoc();
     DeclarationName declName = &m_Context.Idents.get(name);
     clang::LookupResult R(m_Sema, declName, noLoc, Sema::LookupOrdinaryName);
 
@@ -1051,10 +1077,8 @@ namespace clad {
   }
 
   Expr* VisitorBase::BuildIdentityMatrixExpr(clang::QualType T,
-                                             MutableArrayRef<Expr*> Args,
-                                             clang::SourceLocation Loc) {
-    return BuildCallExprToCladFunction(/*name=*/"identity_matrix", Args, {T},
-                                       Loc);
+                                             MutableArrayRef<Expr*> Args) {
+    return BuildCallExprToCladFunction(/*name=*/"identity_matrix", Args, {T});
   }
 
   Expr* VisitorBase::BuildArrayRefSizeExpr(Expr* Base) {
@@ -1392,37 +1416,15 @@ namespace clad {
     CSS.Extend(m_Context, utils::GetCladNamespace(m_Sema), noLoc, noLoc);
     auto* pushDRE =
         m_Sema.BuildDeclarationNameExpr(CSS, init, false).getAs<DeclRefExpr>();
-    return m_Sema.ActOnCallExpr(getCurrentScope(), pushDRE, noLoc, args, noLoc)
-        .get();
+    return BuildCallExpr(pushDRE, args);
   }
 
   Expr* VisitorBase::GetCladZeroLike(Expr* value) {
-    NamespaceDecl* CladNS = utils::GetCladNamespace(m_Sema);
-    CXXScopeSpec CSS;
-    CSS.Extend(m_Context, CladNS, noLoc, noLoc);
-
-    LookupResult R = tryLookupCladMethod("zero_like");
-    if (R.empty())
-      return nullptr; // LCOV_EXCL_LINE: version-mismatched runtime header
-
-    ExprResult NameExpr =
-        m_Sema.BuildDeclarationNameExpr(CSS, R, /*NeedsADL=*/false);
-    if (NameExpr.isInvalid())
-      return nullptr; // LCOV_EXCL_LINE: defensive Sema failure
-
-    Expr* UnresolvedLookup = NameExpr.get();
-    llvm::SmallVector<Expr*, 1> args{value};
-    auto ARargs = llvm::MutableArrayRef<Expr*>(args);
-
-    // A missing customization is an expected, silent fallback path. Reuse the
-    // same overload probe as custom derivatives instead of asking Sema to
-    // diagnose an invalid call.
-    if (m_Builder.noOverloadExists(UnresolvedLookup, ARargs))
+    FunctionDecl* zeroLike = utils::LookupCladZeroLike(m_Sema, value);
+    if (!zeroLike)
       return nullptr;
-
-    ExprResult Call = m_Sema.ActOnCallExpr(getCurrentScope(), UnresolvedLookup,
-                                           noLoc, ARargs, noLoc);
-    return Call.isInvalid() ? nullptr : Call.get();
+    llvm::SmallVector<Expr*, 1> args{value};
+    return BuildCallExpr(BuildDeclRef(zeroLike), args);
   }
 
   FunctionDecl* VisitorBase::CreateDerivativeOverload(FunctionDecl* derivative,
@@ -1533,7 +1535,7 @@ namespace clad {
         m_Sema.PushOnScopeChains(PVD, getCurrentScope(),
                                  /*AddToContext=*/false);
 
-    diffOverloadFD->setParams(overloadParams);
+    utils::SetParams(diffOverloadFD, overloadParams);
     diffOverloadFD->setBody(/*B=*/nullptr);
 
     beginScope(Scope::FnScope | Scope::DeclScope);
@@ -1561,9 +1563,7 @@ namespace clad {
                                       typeInfo, init, noLoc, noLoc)
                    .get();
       } else {
-        SourceLocation fakeLoc = utils::GetValidSLoc(m_Sema);
-        init =
-            m_Sema.BuildCStyleCastExpr(fakeLoc, typeInfo, fakeLoc, init).get();
+        init = BuildCStyleCast(typeInfo, init);
       }
 
       auto* diffVD =
@@ -1632,7 +1632,7 @@ namespace clad {
                                        SourceLocation OpLoc) {
     // Sema requires a valid location for rebuilt operator calls.
     if (!OpLoc.isValid())
-      OpLoc = utils::GetValidSLoc(m_Sema);
+      OpLoc = GenLoc();
 
     // First check operator kinds that are not considered binary/unary.
 

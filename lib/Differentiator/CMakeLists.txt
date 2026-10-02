@@ -52,9 +52,12 @@ llvm_add_library(cladDifferentiator
   DerivedFnInfo.cpp
   DiffPlanner.cpp
   ErrorEstimator.cpp
+  DerivativePrinter.cpp
+  GeneratedCode.cpp
   JacobianModeVisitor.cpp
   HessianModeVisitor.cpp
   MultiplexExternalRMVSource.cpp
+  Options.cpp
   PushForwardModeVisitor.cpp
   ReverseModeForwPassVisitor.cpp
   ReverseModeVisitor.cpp
@@ -68,6 +71,7 @@ llvm_add_library(cladDifferentiator
   VectorPushForwardModeVisitor.cpp
   Version.cpp
   VisitorBase.cpp
+  LoopAnalyzer.cpp
   ${version_inc}
   )
 
@@ -76,3 +80,6 @@ llvm_add_library(cladDifferentiator
 # CMAKE_INCLUDE_CURRENT_DIR here: a host project that adds us with
 # add_subdirectory() need not have it set.
 target_include_directories(cladDifferentiator PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+# The tables are rendered before anything that expands them is compiled. The
+# two private ones land in this directory, which the line above already names.
+add_dependencies(cladDifferentiator clad-tables)
