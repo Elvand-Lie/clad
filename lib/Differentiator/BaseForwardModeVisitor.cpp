@@ -31,6 +31,7 @@
 #include "clang/Basic/Version.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Overload.h"
+#include "clang/Sema/Ownership.h"
 #include "clang/Sema/Scope.h"
 #include "clang/Sema/ScopeInfo.h"
 #include "clang/Sema/Sema.h"
@@ -153,7 +154,9 @@ DerivativeAndOverload BaseForwardModeVisitor::Derive() {
   SourceLocation validLoc{m_DiffReq->getLocation()};
   DeclarationNameInfo name(II, validLoc);
   llvm::SaveAndRestore<DeclContext*> SaveContext(m_Sema.CurContext);
-  llvm::SaveAndRestore<Scope*> SaveScope(getCurrentScope());
+  // Nested derivatives must not search the caller's local scopes.
+  llvm::SaveAndRestore<Scope*> SaveScope(getCurrentScope(),
+                                         getEnclosingNamespaceOrTUScope());
 
   m_Sema.CurContext = DC;
   QualType derivedFnType = GetDerivativeType();
@@ -173,7 +176,7 @@ DerivativeAndOverload BaseForwardModeVisitor::Derive() {
   llvm::SmallVector<ParmVarDecl*, 16> params;
   SetupDerivativeParameters(params);
 
-  m_Derivative->setParams(params);
+  utils::SetParams(m_Derivative, params);
   m_Derivative->setBody(nullptr);
 
   m_Sema.PopFunctionScopeInfo();
@@ -200,6 +203,18 @@ DerivativeAndOverload BaseForwardModeVisitor::Derive() {
         addToCurrentBlock(S);
     else
       addToCurrentBlock(BodyDiff);
+    // The primal wrote its result through a parameter and returned nothing, so
+    // GetDerivativeType gave the derivative that parameter's tangent as its
+    // return type. Hand the tangent back; without this it stays a local the
+    // caller has no way to read.
+    // A primal that already ends in `return;` had its tangent returned by
+    // VisitReturnStmt a moment ago, and a second one here would be
+    // unreachable code in the user's translation unit.
+    if (Expr* outputTangent = GetOutputParamTangent()) {
+      Stmts& block = getCurrentBlock();
+      if (block.empty() || !isa<ReturnStmt>(block.back()))
+        addToCurrentBlock(BuildReturnStmt(outputTangent));
+    }
     Stmt* fnBody = endBlock();
     // FIXME: Enable this when we vgvassilev/clad#367 (removing goto stmts).
     // // If ActOnFinishFunctionBody should pop the current DeclContext.
@@ -306,13 +321,39 @@ void BaseForwardModeVisitor::SetupDerivativeParameters(
       continue;
 
     IdentifierInfo* II = &m_Context.Idents.get("_d_" + PVD->getNameAsString());
+    if (std::any_of(params.begin(), params.end(),
+                    [II](const ParmVarDecl* Param) {
+                      return Param->getIdentifier() == II;
+                    }))
+      II = CreateUniqueIdentifier(II->getName());
     QualType diffTy = utils::GetParameterDerivativeType(m_Sema, m_DiffReq.Mode,
                                                         PVD->getType());
     auto* dPVD = utils::BuildParmVarDecl(m_Sema, m_Derivative, II, diffTy,
                                          PVD->getStorageClass());
+    m_Sema.PushOnScopeChains(dPVD, getCurrentScope(), /*AddToContext=*/false);
     params.push_back(dPVD);
     m_Variables[PVD] = {dPVD};
   }
+}
+
+Expr* BaseForwardModeVisitor::GetOutputParamTangent() {
+  // The request knows which parameter a void-returning primal writes its
+  // result through; only a derivative GetDerivativeType then gave a return
+  // type of its own has that tangent to hand back. Every other forward
+  // derivative keeps the primal's return type, and a pushforward has
+  // somewhere to put an output parameter's tangent already.
+  const ParmVarDecl* outputParam = m_DiffReq.getOutputTangentParam();
+  if (!outputParam || !m_Derivative ||
+      m_Derivative->getReturnType()->isVoidType())
+    return nullptr;
+
+  // GenerateSeeds keys the tangents by the derivative's own parameters, which
+  // SetupDerivativeParameters cloned from the primal's in order.
+  auto found = m_Variables.find(
+      m_Derivative->getParamDecl(outputParam->getFunctionScopeIndex()));
+  assert(found != m_Variables.end() && found->second.Decl &&
+         "GenerateSeeds gives a differentiable parameter a tangent");
+  return BuildDeclRef(found->second.Decl);
 }
 
 void BaseForwardModeVisitor::GenerateSeeds(const clang::FunctionDecl* dFD) {
@@ -438,7 +479,7 @@ void BaseForwardModeVisitor::GenerateSeeds(const clang::FunctionDecl* dFD) {
               m_Context.IntTy, m_Context, dValue);
           dArrVal.push_back(dValueLiteral);
         }
-        dInitializer = m_Sema.ActOnInitList(validLoc, dArrVal, validLoc).get();
+        dInitializer = BuildInitList(dArrVal);
       } else if (const auto* ptrType =
                      dyn_cast<PointerType>(fieldType.getTypePtr())) {
         if (!ptrType->getPointeeType()->isRealType())
@@ -463,6 +504,11 @@ StmtDiff BaseForwardModeVisitor::VisitStmt(const Stmt* S) {
   diagUnsupported(S);
   // Unknown stmt, just clone it.
   return StmtDiff(Clone(S));
+}
+
+StmtDiff BaseForwardModeVisitor::VisitAttributedStmt(const AttributedStmt* S) {
+  const Stmt* SubStmt = utils::SkipLikelihoodHints(S);
+  return SubStmt == S ? VisitStmt(S) : Visit(SubStmt);
 }
 
 StmtDiff BaseForwardModeVisitor::VisitCompoundStmt(const CompoundStmt* CS) {
@@ -784,8 +830,16 @@ StmtDiff BaseForwardModeVisitor::VisitForStmt(const ForStmt* FS) {
 
 StmtDiff BaseForwardModeVisitor::VisitReturnStmt(const ReturnStmt* RS) {
   // If there is no return value, we must not attempt to differentiate
-  if (!RS->getRetValue())
+  if (!RS->getRetValue()) {
+    // Unless the derivative has a return value of its own: a void primal
+    // whose tangent is its output parameter's. Dropping the statement would
+    // not merely lose the tangent on this path, it would lose the path --
+    // the derivative would carry on and write the output the primal left
+    // alone. Return the tangent as it stands here instead.
+    if (Expr* outputTangent = GetOutputParamTangent())
+      return StmtDiff(BuildReturnStmt(outputTangent));
     return nullptr;
+  }
 
   StmtDiff retValDiff = Visit(RS->getRetValue());
   Stmt* returnStmt =
@@ -849,8 +903,8 @@ StmtDiff BaseForwardModeVisitor::VisitInitListExpr(const InitListExpr* ILE) {
     derivedExprs[i] = ResultI.getExpr_dx();
   }
 
-  Expr* clonedILE = m_Sema.ActOnInitList(noLoc, clonedExprs, noLoc).get();
-  Expr* derivedILE = m_Sema.ActOnInitList(noLoc, derivedExprs, noLoc).get();
+  Expr* clonedILE = BuildInitList(clonedExprs);
+  Expr* derivedILE = BuildInitList(derivedExprs);
   return StmtDiff(clonedILE, derivedILE);
 }
 
@@ -1298,7 +1352,10 @@ StmtDiff BaseForwardModeVisitor::VisitCallExpr(const CallExpr* CE) {
 
               // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
               auto* initList = new (m_Context) InitListExpr(
-                  m_Context, CE->getBeginLoc(), initExprs, CE->getEndLoc());
+                  m_Context, CE->getBeginLoc(), initExprs,
+                  CE->getEndLoc()
+                      CLAD_COMPAT_CLANG23_InitListExpr_IsExplicit_ExtraParam(
+                          /*isExplicit=*/true));
               initList->setType(arrType);
 
               TypeSourceInfo* tInfo =
@@ -1341,10 +1398,6 @@ StmtDiff BaseForwardModeVisitor::VisitCallExpr(const CallExpr* CE) {
                            diffArgs.end());
 
   Expr* callDiff = nullptr;
-  // FIXME: Move non-differentiable function handling to the DiffPlanner.
-  // If all arguments are constant literals, then this does not contribute to
-  // the gradient.
-  // FIXME: revert this when this is integrated in the activity analysis pass.
 
   QualType returnType = FD->getReturnType();
   // FIXME: Decide this in the diff planner
@@ -1353,29 +1406,29 @@ StmtDiff BaseForwardModeVisitor::VisitCallExpr(const CallExpr* CE) {
   if (!callDiff) {
     if (!isa<CXXOperatorCallExpr>(CE) && !isa<CXXMemberCallExpr>(CE) &&
         !needsForwPass) {
-      bool allArgsHaveZeroDerivatives = true;
-      for (unsigned i = 0, e = diffArgs.size(); i < e; ++i) {
-        Expr* dArg = diffArgs[i];
-        // If argDiff.expr_dx is nullptr or is a constant 0, then the derivative
-        // of the function call is 0. Constant-fold rather than pattern-match a
-        // literal: by the time a tangent reaches a call it has usually been
-        // bound to a `const` variable, and seeding one direction of a
-        // multi-directional request leaves every other tangent exactly that --
-        // a zero-initialized constant.
-        if (!clad::utils::IsZeroOrNullValue(dArg, m_Context)) {
-          allArgsHaveZeroDerivatives = false;
-          break;
-        }
+      // The planner's varied analysis already knows whether any argument of
+      // the call depends on the direction being differentiated.
+      bool contributes = m_DiffReq.shouldHavePushforward(CE);
+      // Activity is tracked per variable: seeding p[1] leaves the whole of p
+      // varied, but the tangents are built with the seeded index in hand and
+      // still recognize `f(p[0])` as inactive.
+      // FIXME: Drop this once varied analysis resolves array elements.
+      if (contributes) {
+        contributes = false;
+        for (const Expr* dArg : diffArgs)
+          if (!clad::utils::IsZeroOrNullValue(dArg, m_Context)) {
+            contributes = true;
+            break;
+          }
       }
-      if (allArgsHaveZeroDerivatives) {
+      if (!contributes) {
         Expr* call =
             m_Sema
                 .ActOnCallExpr(getCurrentScope(), Clone(CE->getCallee()),
                                validLoc, llvm::MutableArrayRef<Expr*>(CallArgs),
                                validLoc, CUDAExecConfig)
                 .get();
-        auto* zero = getZeroInit(CE->getType());
-        return StmtDiff(call, zero);
+        return StmtDiff(call, getZeroInit(CE->getType()));
       }
     }
   }
@@ -1389,8 +1442,7 @@ StmtDiff BaseForwardModeVisitor::VisitCallExpr(const CallExpr* CE) {
     pushforwardFnRequest.BaseFunctionName = utils::ComputeEffectiveFnName(FD);
     // Silence diag outputs in nested derivation process.
     pushforwardFnRequest.VerboseDiags = false;
-    pushforwardFnRequest.EnableTBRAnalysis = m_DiffReq.EnableTBRAnalysis;
-    pushforwardFnRequest.EnableVariedAnalysis = m_DiffReq.EnableVariedAnalysis;
+    pushforwardFnRequest.inheritAnalysesFrom(m_DiffReq);
 
     FunctionDecl* pushforwardFD = nullptr;
     if (m_DiffReq.CurrentDerivativeOrder != 1 || !m_DiffReq.CallContext) {
@@ -1745,12 +1797,12 @@ BaseForwardModeVisitor::VisitBinaryOperator(const BinaryOperator* BinOp) {
 }
 
 DeclDiff<VarDecl>
-BaseForwardModeVisitor::DifferentiateVarDecl(const VarDecl* VD) {
+BaseForwardModeVisitor::DifferentiateVarDecl(const clang::VarDecl* VD) {
   return DifferentiateVarDecl(VD, false);
 }
 
 DeclDiff<VarDecl>
-BaseForwardModeVisitor::DifferentiateVarDecl(const VarDecl* VD,
+BaseForwardModeVisitor::DifferentiateVarDecl(const clang::VarDecl* VD,
                                              bool ignoreInit) {
   StmtDiff initDiff{};
   const Expr* init = VD->getInit();
@@ -1892,6 +1944,10 @@ StmtDiff BaseForwardModeVisitor::VisitDeclStmt(const DeclStmt* DS) {
       decls.push_back(VDDiff.getDecl());
       if (VDDiff.getDecl_dx())
         declsDiff.push_back(VDDiff.getDecl_dx());
+    } else if (const auto* TND = dyn_cast<TypedefNameDecl>(D)) {
+      // An alias carries no value and so no derivative, but the statements
+      // after it go on naming the type by it.
+      decls.push_back(BuildTypedefNameDecl(TND));
     } else if (auto* SAD = dyn_cast<StaticAssertDecl>(D)) {
       DeclDiff<StaticAssertDecl> SADDiff = DifferentiateStaticAssertDecl(SAD);
       if (SADDiff.getDecl())
@@ -1923,17 +1979,10 @@ BaseForwardModeVisitor::VisitImplicitCastExpr(const ImplicitCastExpr* ICE) {
 StmtDiff BaseForwardModeVisitor::VisitCXXFunctionalCastExpr(
     const clang::CXXFunctionalCastExpr* FCE) {
   StmtDiff castExprDiff = Visit(FCE->getSubExpr());
-  SourceLocation fakeLoc = utils::GetValidSLoc(m_Sema);
-  Expr* clonedFCE = m_Sema
-                        .BuildCXXFunctionalCastExpr(
-                            FCE->getTypeInfoAsWritten(), FCE->getType(),
-                            fakeLoc, castExprDiff.getExpr(), fakeLoc)
-                        .get();
-  Expr* derivedFCE = m_Sema
-                         .BuildCXXFunctionalCastExpr(
-                             FCE->getTypeInfoAsWritten(), FCE->getType(),
-                             fakeLoc, castExprDiff.getExpr_dx(), fakeLoc)
-                         .get();
+  Expr* clonedFCE = BuildFunctionalCast(FCE->getTypeInfoAsWritten(),
+                                        FCE->getType(), castExprDiff.getExpr());
+  Expr* derivedFCE = BuildFunctionalCast(
+      FCE->getTypeInfoAsWritten(), FCE->getType(), castExprDiff.getExpr_dx());
   return {clonedFCE, derivedFCE};
 }
 
@@ -2045,9 +2094,9 @@ BaseForwardModeVisitor::VisitCharacterLiteral(const CharacterLiteral* CL) {
 }
 
 StmtDiff BaseForwardModeVisitor::VisitStringLiteral(const StringLiteral* SL) {
-  return StmtDiff(Clone(SL), StringLiteral::Create(
-                                 m_Context, "", SL->getKind(), SL->isPascal(),
-                                 SL->getType(), utils::GetValidSLoc(m_Sema)));
+  return StmtDiff(Clone(SL), StringLiteral::Create(m_Context, "", SL->getKind(),
+                                                   SL->isPascal(),
+                                                   SL->getType(), GenLoc()));
 }
 
 StmtDiff
@@ -2168,12 +2217,13 @@ StmtDiff BaseForwardModeVisitor::VisitDoStmt(const DoStmt* DS) {
 }
 
 /// returns first switch case label contained in the compound statement `CS`.
-static SwitchCase* getContainedSwitchCaseStmt(const CompoundStmt* CS) {
-  for (Stmt* stmt : CS->body()) {
+static const SwitchCase* getContainedSwitchCaseStmt(const CompoundStmt* CS) {
+  for (const Stmt* stmt : CS->body()) {
+    stmt = utils::SkipLikelihoodHints(stmt);
     if (auto SC = dyn_cast<SwitchCase>(stmt))
       return SC;
     else if (auto nestedCS = dyn_cast<CompoundStmt>(stmt)) {
-      if (SwitchCase* nestedRes = getContainedSwitchCaseStmt(nestedCS))
+      if (const SwitchCase* nestedRes = getContainedSwitchCaseStmt(nestedCS))
         return nestedRes;
     }
   }
@@ -2236,14 +2286,14 @@ StmtDiff BaseForwardModeVisitor::VisitSwitchStmt(const SwitchStmt* SS) {
   // It will always be equal to the last visited case/default label.
   SwitchCase* activeSC = nullptr;
 
-  if (auto CS = dyn_cast<CompoundStmt>(SS->getBody())) {
+  const Stmt* SwitchBody = utils::SkipLikelihoodHints(SS->getBody());
+  if (auto CS = dyn_cast<CompoundStmt>(SwitchBody)) {
     // Visit(CS) cannot be used because then we will not be easily able to
     // determine when active switch case label should be changed.
-    for (Stmt* stmt : CS->body()) {
+    for (const Stmt* stmt : CS->body())
       activeSC = DeriveSwitchStmtBodyHelper(stmt, activeSC);
-    }
   } else {
-    activeSC = DeriveSwitchStmtBodyHelper(SS->getBody(), activeSC);
+    activeSC = DeriveSwitchStmtBodyHelper(SwitchBody, activeSC);
   }
 
   // scope and block of the last switch case label is not popped in
@@ -2275,6 +2325,7 @@ StmtDiff BaseForwardModeVisitor::VisitSwitchStmt(const SwitchStmt* SS) {
 SwitchCase*
 BaseForwardModeVisitor::DeriveSwitchStmtBodyHelper(const Stmt* stmt,
                                                    SwitchCase* activeSC) {
+  stmt = utils::SkipLikelihoodHints(stmt);
   if (auto SC = dyn_cast<SwitchCase>(stmt)) {
     // New switch case label have been visited. Pop the scope and block
     // corresponding to the active switch case label, and update its
@@ -2416,8 +2467,8 @@ BaseForwardModeVisitor::VisitCXXConstructExpr(const CXXConstructExpr* CE) {
       // Rely on the initializer list expressions as they seem to be more
       // flexible in terms of conversions and other similar scenarios where a
       // constructor is called implicitly.
-      clonedArgsE = m_Sema.ActOnInitList(noLoc, clonedArgs, noLoc).get();
-      derivedArgsE = m_Sema.ActOnInitList(noLoc, derivedArgs, noLoc).get();
+      clonedArgsE = BuildInitList(clonedArgs);
+      derivedArgsE = BuildInitList(derivedArgs);
     }
   } else {
     clonedArgsE = clonedArgs[0];
@@ -2457,18 +2508,15 @@ StmtDiff BaseForwardModeVisitor::VisitCXXTemporaryObjectExpr(
     derivedArgs.push_back(argDiff.getExpr_dx());
   }
 
-  Expr* clonedTOE =
-      m_Sema
-          .ActOnCXXTypeConstructExpr(OpaquePtr<QualType>::make(TOE->getType()),
-                                     utils::GetValidSLoc(m_Sema), clonedArgs,
-                                     utils::GetValidSLoc(m_Sema),
-                                     TOE->isListInitialization())
-          .get();
+  Expr* clonedTOE = m_Sema
+                        .ActOnCXXTypeConstructExpr(
+                            OpaquePtr<QualType>::make(TOE->getType()), GenLoc(),
+                            clonedArgs, GenLoc(), TOE->isListInitialization())
+                        .get();
   Expr* derivedTOE =
       m_Sema
           .ActOnCXXTypeConstructExpr(OpaquePtr<QualType>::make(TOE->getType()),
-                                     utils::GetValidSLoc(m_Sema), derivedArgs,
-                                     utils::GetValidSLoc(m_Sema),
+                                     GenLoc(), derivedArgs, GenLoc(),
                                      TOE->isListInitialization())
           .get();
   return {clonedTOE, derivedTOE};

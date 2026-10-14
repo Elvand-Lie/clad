@@ -20,8 +20,10 @@
 #include "clang/Basic/Specifiers.h"
 #include "clang/Basic/Version.h"
 #include "clang/Sema/DeclSpec.h"
+
 #include "clang/Sema/Ownership.h"
 #include "clang/Sema/Sema.h"
+#include "llvm/Support/Casting.h"
 #if CLANG_VERSION_MAJOR > 18
 #include "clang/Sema/SemaOpenMP.h"
 #endif
@@ -184,6 +186,24 @@ inline bool isElaboratedType(clang::QualType QT) {
   return QT->getAs<clang::ElaboratedType>() != nullptr;
 }
 
+// Called on each sugar node of a spelling, outermost first: the declaration
+// a typedef, using or tag type names, or null. Pre-22 the qualifier a name is
+// written with is on the ElaboratedType around it, which sets Unqualified; a
+// name without one -- every name before clang 16, a canonical tag since --
+// prints with its full scope.
+inline const clang::NamedDecl* getSpelledName(const clang::Type* T,
+                                              bool& Unqualified) {
+  if (const auto* ET = llvm::dyn_cast<clang::ElaboratedType>(T))
+    Unqualified = !ET->getQualifier();
+  if (const auto* TT = llvm::dyn_cast<clang::TypedefType>(T))
+    return TT->getDecl();
+  if (const auto* UT = llvm::dyn_cast<clang::UsingType>(T))
+    return UT->getFoundDecl();
+  if (const auto* TT = llvm::dyn_cast<clang::TagType>(T))
+    return TT->getDecl();
+  return nullptr;
+}
+
 // Pre-22 getPrefix() worked uniformly on any NNS kind.
 inline bool hasNNSPrefix(clang::NestedNameSpecifier* NS) {
   return NS && NS->getPrefix() != nullptr;
@@ -238,6 +258,26 @@ inline bool isElaboratedType(clang::QualType QT) {
     return TT->getKeyword() != clang::ElaboratedTypeKeyword::None ||
            bool(TT->getQualifier());
   return false;
+}
+
+// Clang 22: the qualifier a name is written with is on its type. A
+// canonical tag type prints with its full scope.
+inline const clang::NamedDecl* getSpelledName(const clang::Type* T,
+                                              bool& Unqualified) {
+  if (const auto* TT = llvm::dyn_cast<clang::TypedefType>(T)) {
+    Unqualified = !hasQualifier(TT->getQualifier());
+    return TT->getDecl();
+  }
+  if (const auto* UT = llvm::dyn_cast<clang::UsingType>(T)) {
+    Unqualified = !hasQualifier(UT->getQualifier());
+    return UT->getDecl();
+  }
+  if (const auto* TT = llvm::dyn_cast<clang::TagType>(T)) {
+    Unqualified =
+        !hasQualifier(TT->getQualifier()) && !TT->isCanonicalUnqualified();
+    return TT->getDecl();
+  }
+  return nullptr;
 }
 
 // Clang 22: only Namespace-kind NNS exposes a prefix; other kinds
@@ -355,6 +395,16 @@ inline clang::QualType getTypeDeclType(clang::ASTContext& C,
 #else
   return C.getTypeDeclType(clang::ElaboratedTypeKeyword::None, std::nullopt,
                            TD);
+#endif
+}
+
+// Clang 16 moved isPromotableIntegerType from Type to ASTContext.
+inline bool isPromotableIntegerType(const clang::ASTContext& C,
+                                    clang::QualType T) {
+#if CLANG_VERSION_MAJOR < 16
+  return T->isPromotableIntegerType();
+#else
+  return C.isPromotableIntegerType(T);
 #endif
 }
 
@@ -510,16 +560,11 @@ static inline IfStmt* IfStmt_Create(const ASTContext &Ctx,
    Stmt *Then, SourceLocation EL=SourceLocation(), Stmt *Else=nullptr)
 {
 
-#if CLANG_VERSION_MAJOR < 14
-  return IfStmt::Create(Ctx, IL, IsConstexpr, Init, Var, Cond, LPL, RPL, Then,
-                        EL, Else);
-#else
   IfStatementKind kind = IfStatementKind::Ordinary;
   if (IsConstexpr)
     kind = IfStatementKind::Constexpr;
   return IfStmt::Create(Ctx, IL, kind, Init, Var, Cond, LPL, RPL, Then, EL,
                         Else);
-#endif
 }
 
 // Compatibility helper function for creation CallExpr and CUDAKernelCallExpr.
@@ -583,17 +628,9 @@ getConstantArrayType(const ASTContext& Ctx, QualType EltTy,
   clang::ParsedAttributesView::none(),
 #endif
 
-#if CLANG_VERSION_MAJOR < 13
-#define CLAD_COMPAT_ExprValueKind_R_or_PR_Value ExprValueKind::VK_RValue
-#elif CLANG_VERSION_MAJOR >= 13
 #define CLAD_COMPAT_ExprValueKind_R_or_PR_Value ExprValueKind::VK_PRValue
-#endif
 
-#if LLVM_VERSION_MAJOR < 13
-#define CLAD_COMPAT_llvm_sys_fs_Append llvm::sys::fs::F_Append
-#elif LLVM_VERSION_MAJOR >= 13
 #define CLAD_COMPAT_llvm_sys_fs_Append llvm::sys::fs::OF_Append
-#endif
 
 #if CLANG_VERSION_MAJOR < 19
 #define CLAD_COMPAT_Sema_ForVisibleRedeclaration Sema::ForVisibleRedeclaration
@@ -602,17 +639,10 @@ getConstantArrayType(const ASTContext& Ctx, QualType EltTy,
   RedeclarationKind::ForVisibleRedeclaration
 #endif
 
-#if CLANG_VERSION_MAJOR <= 13
-#define CLAD_COMPAT_FunctionDecl_UsesFPIntrin_Param(FD) /**/
-#elif CLANG_VERSION_MAJOR > 13
 #define CLAD_COMPAT_FunctionDecl_UsesFPIntrin_Param(FD) , FD->UsesFPIntrin()
-#endif
 
-#if CLANG_VERSION_MAJOR <= 13
-#define CLAD_COMPAT_IfStmt_Create_IfStmtKind_Param(Node) Node->isConstexpr()
-#elif CLANG_VERSION_MAJOR > 13
-#define CLAD_COMPAT_IfStmt_Create_IfStmtKind_Param(Node) Node->getStatementKind()
-#endif
+#define CLAD_COMPAT_IfStmt_Create_IfStmtKind_Param(Node)                       \
+  Node->getStatementKind()
 
 #if CLANG_VERSION_MAJOR < 19
 static inline MemberExpr* BuildMemberExpr(
@@ -705,17 +735,37 @@ ArraySize_GetValue(const std::optional<const Expr*>& opt) {
 #define CLAD_COMPAT_CLANG16_LangOptions_ExtraParams /**/
 #endif
 
-#if CLANG_VERSION_MAJOR < 13
-static inline bool IsPRValue(const Expr* E) { return E->isRValue(); }
-#else
 static inline bool IsPRValue(const Expr* E) { return E->isPRValue(); }
-#endif
 
 #if CLANG_VERSION_MAJOR >= 16
 #define CLAD_COMPAT_CLANG16_CXXDefaultArgExpr_getRewrittenExpr_Param(Node)     \
   , Node->getRewrittenExpr()
 #else
 #define CLAD_COMPAT_CLANG16_CXXDefaultArgExpr_getRewrittenExpr_Param(Node) /**/
+#endif
+
+// Clang 23 widened VAArgExpr's ABI flag from a bool to a three-state
+// VarArgKind (standard, Microsoft, z/OS), so its constructor takes the enum.
+// Before that only the Microsoft bit could be represented, which is what
+// isMicrosoftABI() answers.
+#if CLANG_VERSION_MAJOR < 23
+#define CLAD_COMPAT_CLANG23_VAArgExpr_VarArgKind_Param(Node)                   \
+  Node->isMicrosoftABI()
+#else
+#define CLAD_COMPAT_CLANG23_VAArgExpr_VarArgKind_Param(Node)                   \
+  Node->getVarargABI()
+#endif
+
+// Clang 23 stores whether an initializer list was written with braces rather
+// than deriving it from the brace locations, so the constructor takes it.
+// Before that, InitListExpr::isExplicit() answered
+// `LBraceLoc.isValid() && RBraceLoc.isValid()`; pass what that would have
+// returned to keep the node reading the same on both.
+#if CLANG_VERSION_MAJOR < 23
+#define CLAD_COMPAT_CLANG23_InitListExpr_IsExplicit_ExtraParam(isExplicit) /**/
+#else
+#define CLAD_COMPAT_CLANG23_InitListExpr_IsExplicit_ExtraParam(isExplicit)     \
+  , isExplicit
 #endif
 
 // Clang 15 renamed StringKind::Ascii to StringKind::Ordinary

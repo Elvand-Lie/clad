@@ -8,19 +8,33 @@
 
 #include "clad/Differentiator/DerivativeBuilder.h"
 #include "clad/Differentiator/DiffPlanner.h"
+#include "clad/Differentiator/Options.h"
 #include "clad/Differentiator/Sins.h"
 #include "clad/Differentiator/Timers.h"
 #include "clad/Differentiator/Version.h"
+#include "../lib/Differentiator/Analyses.h"
+#include "../lib/Differentiator/DerivativePrinter.h"
+#include "../lib/Differentiator/Diagnostics.h"
+#include "../lib/Differentiator/GeneratedCode.h"
+#include "../lib/Differentiator/LoopAnalyzer.h"
 #include "../lib/Differentiator/TBRAnalyzer.h"
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
+#include "clang/AST/Expr.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/Stmt.h"
 #include "clang/Basic/CodeGenOptions.h"
 #include "clang/Basic/LLVM.h" // isa, dyn_cast
 #include "clang/Basic/SourceLocation.h"
+// Clang 17 moved the debug info kinds out of clang::codegenoptions and into
+// llvm::codegenoptions.
+#if CLANG_VERSION_MAJOR < 17
+#include "clang/Basic/DebugInfoOptions.h"
+#else
+#include "llvm/Frontend/Debug/Options.h"
+#endif
 
 #ifdef _WIN32
 // <windows.h> defines function-like min/max macros that mangle
@@ -47,6 +61,8 @@
 #include "clang/Sema/Sema.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -60,6 +76,7 @@
 #include <iostream> // for std::cerr
 #include <memory>
 #include <set>
+#include <utility>
 
 using namespace clang;
 
@@ -67,21 +84,21 @@ namespace clad {
 void InitTimers();
 
   namespace plugin {
-    /// Keeps track if we encountered #pragma clad on/off.
-    // FIXME: Figure out how to make it a member of CladPlugin.
-    std::vector<clang::SourceRange> CladEnabledRange;
-    std::set<clang::SourceLocation> CladLoopCheckpoints;
+  /// Keeps track if we encountered `#pragma clad on/off`.
+  // FIXME: Figure out how to make it a member of CladPlugin.
+  std::vector<clang::SourceRange> CladEnabledRange;
+  std::set<clang::SourceLocation> CladLoopCheckpoints;
 
-    // Define a pragma handler for #pragma clad
-    class CladPragmaHandler : public PragmaHandler {
-    public:
-      CladPragmaHandler() : PragmaHandler("clad") {}
-      void HandlePragma(Preprocessor& PP, PragmaIntroducer Introducer,
-                        Token& PragmaTok) override {
-        if (PragmaTok.isNot(tok::identifier)) {
-          PP.Diag(PragmaTok, diag::warn_pragma_diagnostic_invalid);
-          return;
-        }
+  // Define a pragma handler for #pragma clad
+  class CladPragmaHandler : public PragmaHandler {
+  public:
+    CladPragmaHandler() : PragmaHandler("clad") {}
+    void HandlePragma(Preprocessor& PP, PragmaIntroducer Introducer,
+                      Token& PragmaTok) override {
+      if (PragmaTok.isNot(tok::identifier)) {
+        PP.Diag(PragmaTok, diag::warn_pragma_diagnostic_invalid);
+        return;
+      }
 #ifndef NDEBUG
         IdentifierInfo* II = PragmaTok.getIdentifierInfo();
         assert(II->isStr("clad"));
@@ -101,10 +118,10 @@ void InitTimers();
         }
         // Handle #pragma clad OFF/DEFAULT
         if (OptionName == "OFF" || OptionName == "DEFAULT") {
-          if (!CladEnabledRange.empty()) {
-            assert(CladEnabledRange.back().getEnd().isInvalid());
+          // If a second OFF is seen, ignore it if the interval is closed.
+          if (!CladEnabledRange.empty() &&
+              CladEnabledRange.back().getEnd().isInvalid())
             CladEnabledRange.back().setEnd(TokLoc);
-          }
           return;
         }
         // Handle #pragma clad checkpoint loop
@@ -128,46 +145,49 @@ void InitTimers();
             PP.getDiagnostics().getCustomDiagID(
                 DiagnosticsEngine::Error,
                 "expected 'ON', 'OFF', 'DEFAULT', or `checkpoint` in pragma"));
-      }
-    };
+    }
+  };
 
-    CladPlugin::CladPlugin(CompilerInstance& CI, DifferentiationOptions& DO)
-        : m_CI(CI), m_DO(DO), m_HasRuntime(false) {
-      CodeGenOptions& CGOpts = m_CI.getCodeGenOpts();
-      bool WantTiming = CGOpts.TimePasses;
+  CladPlugin::CladPlugin(CompilerInstance& CI, Options& DO)
+      : m_CI(CI), m_DO(DO) {
+    CodeGenOptions& CGOpts = m_CI.getCodeGenOpts();
+    bool WantTiming = CGOpts.TimePasses;
 
-      if (WantTiming || getenv("CLAD_ENABLE_TIMING"))
-        InitTimers();
+    if (WantTiming || getenv("CLAD_ENABLE_TIMING"))
+      InitTimers();
 
-        // Register clad as a backend pass via the path of clad.so itself,
-        // resolved from any symbol we own. Cleaner than iterating
-        // CI.getFrontendOpts().Plugins (which depends on how clang was
-        // invoked) and keeps the lookup inside this DSO.
+      // Register clad as a backend pass via the path of clad.so itself,
+      // resolved from any symbol we own. Cleaner than iterating
+      // CI.getFrontendOpts().Plugins (which depends on how clang was
+      // invoked) and keeps the lookup inside this DSO. Asking which module a
+      // function lives in means handing its address to a C API, which is a
+      // cast neither platform offers a typed spelling for.
 #ifdef CLAD_BUILD_STATIC_ONLY
-        // Skip registration entirely if clad is statically linked
+      // Skip registration entirely if clad is statically linked
 #elif _WIN32
-      HMODULE hm = nullptr;
-      if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                             reinterpret_cast<LPCSTR>(&InitTimers), &hm) &&
-          hm) {
-        char buf[MAX_PATH];
-        if (DWORD n = GetModuleFileNameA(hm, buf, MAX_PATH);
-            n > 0 && n < MAX_PATH)
-          CGOpts.PassPlugins.emplace_back(buf);
-      }
+    HMODULE hm = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&InitTimers), &hm) &&
+        hm) {
+      char buf[MAX_PATH];
+      if (DWORD n = GetModuleFileNameA(hm, buf, MAX_PATH);
+          n > 0 && n < MAX_PATH)
+        CGOpts.PassPlugins.emplace_back(buf);
+    }
 #else
-      if (Dl_info info;
-          dladdr(reinterpret_cast<void*>(&InitTimers), &info) && info.dli_fname)
-        CGOpts.PassPlugins.emplace_back(info.dli_fname);
+    if (Dl_info info;
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        dladdr(reinterpret_cast<void*>(&InitTimers), &info) && info.dli_fname)
+      CGOpts.PassPlugins.emplace_back(info.dli_fname);
 #endif
 
-      // Add define for __CLAD__, so that CladFunction::CladFunction()
-      // doesn't throw an error.
-      auto predefines = m_CI.getPreprocessor().getPredefines();
-      predefines.append("#define __CLAD__ 1\n");
-      m_CI.getPreprocessor().setPredefines(predefines);
-    }
+    // Add define for __CLAD__, so that CladFunction::CladFunction()
+    // doesn't throw an error.
+    auto predefines = m_CI.getPreprocessor().getPredefines();
+    predefines.append("#define __CLAD__ 1\n");
+    m_CI.getPreprocessor().setPredefines(predefines);
+  }
 
     CladPlugin::~CladPlugin() {}
 
@@ -205,6 +225,11 @@ void InitTimers();
     void CladPlugin::HandleTopLevelDeclForClad(DeclGroupRef DGR) {
       if (!CheckBuiltins())
         return;
+
+      // Before anything else, and whether or not an error has already been
+      // reported: a call clad cannot reach in time still deserves an
+      // explanation. See DiagnoseConstantInitRequests.
+      DiagnoseConstantInitRequests(m_CI.getSema(), CladEnabledRange, DGR);
 #if CLANG_VERSION_MAJOR > 16
       // Traverse all constexpr FunctionDecls for the static graph only once to
       // differentiate them immeditely.
@@ -227,9 +252,26 @@ void InitTimers();
       // Plan call above then defers the group; processing requests here would
       // interleave with the outer traversal (and clobber its current
       // processing node), so leave them to the outer caller.
-      if (!getScheduler().isTraversalInFlight())
+      //
+      // It is re-entered while a request is being built, too: Sema hands the
+      // consumers every function it instantiates on the spot, and a constexpr
+      // derivative that calls a constexpr template makes it do so from inside
+      // ProcessDiffRequest. The node in progress is not yet marked processed,
+      // so processing the graph here would build it a second time, and a
+      // third, without end. Leave the graph to the outer call, as
+      // FinalizeTranslationUnit does.
+      if (!getScheduler().isTraversalInFlight() &&
+          !getScheduler().getGraph().isProcessingNode())
         for (DiffRequest& request : getScheduler().getGraph().getNodes()) {
-          if (request.ImmediateMode && request.Function->isConstexpr()) {
+          // Both halves matter. A derivative is needed this early only when
+          // the call asking for it can itself be worked out while the
+          // program compiles, and building one for every constexpr function
+          // instead runs clad before the translation unit is complete, which
+          // it is not ready for -- a name the derivative needs may not be
+          // there yet.
+          if (request.ImmediateContext &&
+              request.ImmediateContext->isConstexpr() &&
+              request.Function->isConstexpr()) {
             getScheduler().getGraph().setCurrentProcessingNode(request);
             ProcessDiffRequest(request);
             getScheduler().getGraph().markCurrentNodeProcessed();
@@ -245,8 +287,363 @@ void InitTimers();
         FinalizeTranslationUnit();
     }
 
+    /// The statements of \p S that the printer gave an offset, paired with it.
+    static void collectStmts(const clang::Stmt* S, DerivativePrinter& Printer,
+                             const clang::FunctionDecl* FD,
+                             llvm::SmallVectorImpl<const clang::Stmt*>& Out) {
+      if (!S)
+        return;
+      if (Printer.locationOf(FD, S).isValid())
+        Out.push_back(S);
+      for (const clang::Stmt* Child : S->children())
+        collectStmts(Child, Printer, FD, Out);
+    }
+
+#if CLANG_VERSION_MAJOR < 17
+    namespace codegenoptions = clang::codegenoptions;
+#else
+    namespace codegenoptions = llvm::codegenoptions;
+#endif
+
+    /// Every statement under \p S standing at a slot, outermost first.
+    static void collectSlotted(const clang::Stmt* S, GeneratedCode& Locs,
+                               llvm::SmallVectorImpl<const clang::Stmt*>& Out) {
+      if (!S)
+        return;
+      if (Locs.owns(S->getBeginLoc()))
+        Out.push_back(S);
+      for (const clang::Stmt* Child : S->children())
+        collectSlotted(Child, Locs, Out);
+    }
+
+    void CladPlugin::materializeGeneratedCode() {
+      if (m_Generated.empty() || !m_DerivativeBuilder)
+        return;
+      // The line notes are for debug information alone: they decide what
+      // CodeGen writes into the line table. A diagnostic reads the printed
+      // code directly.
+      const bool WantLineNotes =
+          m_CI.getCodeGenOpts().getDebugInfo() != codegenoptions::NoDebugInfo;
+      if (!WantLineNotes && !m_DO.RemarkTBRAnalysis &&
+          !m_DO.DumpGeneratedSource)
+        return; // Nobody will read the code, so nobody has to print it.
+
+      // A derivative that gets a forward declaration ahead of its definition
+      // is recorded twice. Only the declaration carrying the body has
+      // anything of its own to say.
+      llvm::erase_if(m_Generated, [](const Generated& G) {
+        return !G.Derivative->doesThisDeclarationHaveABody();
+      });
+
+      GeneratedCode& Code = m_DerivativeBuilder->getGeneratedCode();
+      DerivativePrinter& Printer = getDerivativePrinter();
+
+      // Print first, ask afterwards: a buffer's lines are settled by the
+      // first question about it, and a derivative printed after that would
+      // sit on lines nobody knows are there.
+      for (const Generated& G : m_Generated) {
+        clang::FunctionDecl* FD = G.Derivative;
+        // Printing it is what lineOf does on the way to answering.
+        const unsigned Signature = Printer.lineOf(FD);
+        if (!WantLineNotes)
+          continue;
+
+        // Outermost first, so that an inner statement assigns over the outer
+        // one it sits in and the most specific answer is the one that stays.
+        llvm::SmallVector<const clang::Stmt*, 64> Nodes;
+        collectSlotted(FD->getBody(), Code, Nodes);
+        if (Nodes.empty())
+          continue;
+
+        // A note can only name a line of its own file, so a statement whose
+        // slots landed in another chunk than the printout is left alone. That
+        // is a derivative with more nodes than one chunk holds: it runs on
+        // into the next chunk, the printout stays where it started.
+        const clang::SourceLocation Printed = Printer.startOf(FD);
+
+        // The brace clad built the body with stands for the signature, so
+        // stopping at the function by name lands on its first line.
+        const clang::SourceLocation Brace = FD->getBody()->getBeginLoc();
+        if (Code.isSameChunk(Brace, Printed))
+          Code.assign(Brace, FD->getEndLoc(), Signature);
+
+        for (const clang::Stmt* S : Nodes)
+          if (Code.isSameChunk(S->getBeginLoc(), Printed))
+            Code.assign(S->getBeginLoc(), S->getEndLoc(),
+                        Printer.lineOf(FD, S));
+      }
+
+      // Everything is printed. What the SourceManager worked out about these
+      // buffers while the derivatives were being built describes an emptier
+      // version of them, so drop it before anything asks.
+      Code.forgetLineTables();
+
+      if (WantLineNotes) {
+        Code.present();
+        Code.writeChunksToFiles(m_CI.getDiagnostics());
+        adviseOnGeneratedSource();
+      }
+
+      for (const Generated& G : m_Generated) {
+        if (m_DO.DumpGeneratedSource)
+          dumpGeneratedSource(G.Derivative);
+        emitAnalysisRemarks(G);
+      }
+
+      // All of this has been read now, and incremental compilation comes
+      // back with more derivatives to print somewhere else.
+      Code.seal();
+      m_Generated.clear();
+    }
+
+    void CladPlugin::adviseOnGeneratedSource() const {
+      // Only when there is nothing to read. A debugger reaches the code clad
+      // generated either through the object, which needs -gembed-source and a
+      // debugger that understands it, or through a file on disk.
+      // Naming the flag at all is an answer, even with no directory after it:
+      // it says the generated code being unreadable is known and meant.
+      if (m_DO.GeneratedSourceDir)
+        return;
+      const clang::CodeGenOptions& CGO = m_CI.getCodeGenOpts();
+      // Through the enum's own type rather than by name: which header spells
+      // it, and in which namespace, has moved between releases.
+      const auto Tuning = CGO.getDebuggerTuning();
+      const bool ReadsEmbedded = Tuning == decltype(Tuning)::LLDB;
+      if (CGO.EmbedSource && ReadsEmbedded)
+        return;
+      const char* Advice =
+          ReadsEmbedded ? "add -gembed-source, or -plugin-arg-clad "
+                          "-fgenerated-source-dir=<dir>"
+                        : "add -plugin-arg-clad -fgenerated-source-dir=<dir>";
+      unsigned ID = m_CI.getDiagnostics().getCustomDiagID(
+          clang::DiagnosticsEngine::Warning,
+          "debug information for the code clad generated points at no source a "
+          "debugger can open; %0");
+      m_CI.getDiagnostics().Report(ID) << Advice;
+    }
+
+    void CladPlugin::dumpGeneratedSource(clang::Decl* D) {
+      const auto* FD = llvm::dyn_cast<clang::FunctionDecl>(D);
+      if (!FD || !FD->getBody())
+        return;
+
+      llvm::outs() << "generated-source: " << FD->getNameAsString() << "\n";
+      // Every statement the printer announced, in the order its text appears.
+      llvm::SmallVector<const clang::Stmt*, 32> Ordered;
+      collectStmts(FD->getBody(), getDerivativePrinter(), FD, Ordered);
+      clang::SourceManager& SM = m_CI.getSourceManager();
+      // Into the printed text, not into the buffer it sits in: every
+      // derivative printed after the first starts part-way through its buffer,
+      // and indexing its text by a buffer offset runs off the end of it.
+      auto offsetOf = [&](const clang::Stmt* S) {
+        return getDerivativePrinter().offsetOf(FD, S);
+      };
+      llvm::stable_sort(Ordered,
+                        [&](const clang::Stmt* A, const clang::Stmt* B) {
+                          return offsetOf(A) < offsetOf(B);
+                        });
+      llvm::StringRef Text = getDerivativePrinter().textOf(FD);
+      unsigned Last = ~0U;
+      for (const clang::Stmt* S : Ordered) {
+        // One line per position: the innermost and outermost node starting at
+        // the same character would otherwise repeat it.
+        unsigned Offset = offsetOf(S);
+        if (Offset == Last)
+          continue;
+        Last = Offset;
+        clang::SourceRange R = getDerivativePrinter().rangeOf(FD, S);
+        clang::PresumedLoc B = SM.getPresumedLoc(R.getBegin());
+        clang::PresumedLoc E = SM.getPresumedLoc(R.getEnd());
+        // Begin and end columns, so a test can pin how wide a node is and not
+        // just where it starts.
+        // A node measured to one line reports its span; one that could not be
+        // measured reports just where it starts.
+        llvm::outs() << "  " << B.getLine() << ":" << B.getColumn();
+        if (R.getEnd().isValid() && E.getLine() == B.getLine() &&
+            E.getColumn() >= B.getColumn())
+          llvm::outs() << "-" << E.getColumn();
+        llvm::outs() << ": " << Text.drop_front(Offset).take_until([](char C) {
+          return C == '\n';
+        }) << "\n";
+      }
+    }
+
+    /// Whether \p VD holds a value clad kept for the reverse sweep.
+    ///
+    /// Clad names its temporaries `_t<N>`, but not all of them are kept
+    /// values: a tape is the container for values kept in a loop, and a loop
+    /// counter is bookkeeping. Reporting either as a cost the analysis failed
+    /// to remove would be wrong, not merely noisy.
+    // FIXME: This reads clad's naming convention from the outside. The
+    // durable answer is for the visitor to mark a store as it emits one.
+    static bool isKeptValue(const clang::VarDecl* VD) {
+      if (!VD->hasInit() || !VD->getName().starts_with("_t"))
+        return false;
+      if (VD->getType().getAsString().find("tape") != std::string::npos)
+        return false;
+      return !llvm::isa<clang::IntegerLiteral>(
+          VD->getInit()->IgnoreParenImpCasts());
+    }
+
+    /// The values a derivative keeps for its reverse sweep, in the order they
+    /// appear. Clad names them `_t<N>`; a value kept in a loop goes onto a
+    /// tape instead, so count both.
+    static void collectKeptValues(
+        const clang::Stmt* S,
+        llvm::SmallVectorImpl<
+            std::pair<const clang::Stmt*, const clang::VarDecl*>>& Out) {
+      if (!S)
+        return;
+      if (const auto* DS = llvm::dyn_cast<clang::DeclStmt>(S))
+        for (const clang::Decl* D : DS->decls())
+          if (const auto* VD = llvm::dyn_cast<clang::VarDecl>(D))
+            if (isKeptValue(VD))
+              Out.emplace_back(S, VD);
+      // A value kept once per iteration goes onto a tape rather than into its
+      // own variable. The push is the thing that costs, not the tape.
+      if (const auto* CE = llvm::dyn_cast<clang::CallExpr>(S))
+        if (const clang::FunctionDecl* Callee = CE->getDirectCallee())
+          if (Callee->getName() == "push" && CE->getNumArgs() == 2)
+            Out.emplace_back(S, nullptr);
+      for (const clang::Stmt* Child : S->children())
+        collectKeptValues(Child, Out);
+    }
+
+    /// The primal expression itself, so the note underlines all of it. The
+    /// clone kept its original range, so this is the user's own code.
+    static clang::SourceRange primalRangeOf(const clang::Stmt* K,
+                                            const clang::VarDecl* VD) {
+      const clang::Expr* Init =
+          VD ? VD->getInit() : llvm::cast<clang::CallExpr>(K)->getArg(1);
+      return Init ? Init->getSourceRange() : clang::SourceRange();
+    }
+
+    /// Where in the user's code the kept value came from.
+    ///
+    /// The stored initializer is a clone of a primal expression and carries
+    /// that expression's location, so a note can point at code the user can
+    /// actually change -- which the remark itself cannot, since it points at
+    /// code clad wrote. Nodes clad invented outright carry GetValidSLoc, the
+    /// start of the main file; a caret on line one would be worse than saying
+    /// nothing, so those report no location at all.
+    static clang::SourceLocation
+    primalLocationOf(const clang::Stmt* K, const clang::VarDecl* VD,
+                     const clang::SourceManager& SM) {
+      const clang::Expr* Init = nullptr;
+      if (VD)
+        Init = VD->getInit();
+      else if (const auto* CE = llvm::dyn_cast<clang::CallExpr>(K))
+        Init = CE->getArg(1); // what the push saves
+      if (!Init)
+        return {};
+      clang::SourceLocation Loc = Init->getBeginLoc();
+      if (Loc.isInvalid() || !Loc.isFileID())
+        return {};
+      if (Loc == SM.getLocForStartOfFile(SM.getMainFileID()))
+        return {};
+      return Loc;
+    }
+
+    void CladPlugin::emitAnalysisRemarks(const Generated& G) {
+      if (!m_DO.RemarkTBRAnalysis)
+        return;
+      const clang::FunctionDecl* FD = G.Derivative;
+      if (!FD->getBody())
+        return;
+
+      llvm::SmallVector<std::pair<const clang::Stmt*, const clang::VarDecl*>,
+                        16>
+          Kept;
+      collectKeptValues(FD->getBody(), Kept);
+      if (Kept.empty())
+        return; // Nothing to say, so nothing gets rendered.
+
+      clang::Sema& S = m_CI.getSema();
+      // Why the value is still here is a different sentence depending on
+      // whether the analysis ran at all; saying "could not prove" when it was
+      // switched off would be false.
+      const CladDiag Because = G.AnalysisRan
+                                   ? CladDiag::note_tbr_could_not_prove
+                                   : CladDiag::note_tbr_disabled;
+      const clang::SourceManager& SM = m_CI.getSourceManager();
+      for (const auto& [K, VD] : Kept) {
+        clang::SourceLocation Loc = getDerivativePrinter().locationOf(FD, K);
+        if (Loc.isInvalid())
+          continue;
+        utils::diag(S, CladDiag::remark_value_kept, Loc)
+            << getDerivativePrinter().rangeOf(FD, K);
+        utils::diag(S, Because, Loc);
+        // Which derivative this is, said outright rather than left to the
+        // include stack, which has no caret and no wording.
+        if (G.RequestedAt.isValid())
+          utils::diag(S, CladDiag::note_derivative_requested, G.RequestedAt)
+              << G.Original->getNameAsString();
+        // The half the user can act on: the expression in their own code
+        // whose value this is. Only if it is theirs -- a kept value can be one
+        // clad introduced, and the expression behind that one was built, not
+        // written, so there is nothing of theirs to underline.
+        const clang::SourceLocation Primal = primalLocationOf(K, VD, SM);
+        if (Primal.isValid() &&
+            !m_DerivativeBuilder->getGeneratedCode().owns(Primal))
+          utils::diag(S, CladDiag::note_kept_value_is, Primal)
+              << primalRangeOf(K, VD);
+      }
+    }
+
+    /// Reports, per parameter, the range of it the function was proven to
+    /// write. A parameter that prints `unknown` is one a caller cannot record
+    /// from, so it is the interesting half of the report.
+    static void printWrittenExtents(const DiffRequest& R) {
+      const clang::FunctionDecl* FD = R.Function;
+      llvm::ArrayRef<WrittenExtent> Extents = R.getWrittenExtents();
+      // Nothing was proven because nothing was asked. Saying so beats one
+      // `none` per parameter, which reads as "writes nothing".
+      if (Extents.size() != FD->getNumParams()) {
+        llvm::outs() << "written-extent: " << FD->getNameAsString()
+                     << ": loop analysis is disabled\n";
+        return;
+      }
+      for (unsigned i = 0, e = FD->getNumParams(); i != e; ++i) {
+        llvm::outs() << "written-extent: " << FD->getNameAsString() << ": "
+                     << FD->getParamDecl(i)->getNameAsString() << " = ";
+        const WrittenExtent& W = Extents[i];
+        switch (W.K) {
+        case WrittenExtent::Kind::None:
+          llvm::outs() << "none";
+          break;
+        case WrittenExtent::Kind::Element:
+          llvm::outs() << "[" << W.Offset << ", " << (W.Offset + 1) << ")";
+          break;
+        case WrittenExtent::Kind::Range:
+          llvm::outs() << "[0, ";
+          if (W.BoundIsParam)
+            llvm::outs()
+                << FD->getParamDecl(W.BoundParamIdx)->getNameAsString();
+          else
+            llvm::outs() << W.BoundConst;
+          llvm::outs() << ")";
+          break;
+        case WrittenExtent::Kind::Unknown:
+          // Report why, not just that: which refusal it was is what tells a
+          // reader whether the code or the analysis is the thing to change.
+          llvm::outs() << "unknown (" << detailOf(W.Why);
+          // The line the refusal is about, so a reader can go look at it
+          // rather than re-find it; the remark below puts a caret on it.
+          if (W.RefusedAt.isValid()) {
+            const clang::SourceManager& SM =
+                FD->getASTContext().getSourceManager();
+            llvm::outs() << " at line "
+                         << SM.getPresumedLoc(W.RefusedAt).getLine();
+          }
+          llvm::outs() << ")";
+          break;
+        }
+        llvm::outs() << "\n";
+      }
+    }
+
     static void printDerivative(clang::Decl* D, bool DeclarationOnly,
-                                const DifferentiationOptions& DO) {
+                                const Options& DO) {
       clang::LangOptions LangOpts;
       LangOpts.CPlusPlus = true;
       clang::PrintingPolicy Policy(LangOpts);
@@ -352,9 +749,15 @@ void InitTimers();
 
     FunctionDecl* CladPlugin::ProcessDiffRequest(DiffRequest& request) {
       Sema& S = m_CI.getSema();
-      if (!m_DerivativeBuilder)
+      if (!m_DerivativeBuilder) {
         m_DerivativeBuilder =
             std::make_unique<DerivativeBuilder>(S, *this, getScheduler());
+        // Before the first chunk is made: a chunk keeps the name it was made
+        // with, and that name is what the line table records.
+        if (m_DO.GeneratedSourceDir && !m_DO.GeneratedSourceDir->empty())
+          m_DerivativeBuilder->getGeneratedCode().setFileBase(
+              *m_DO.GeneratedSourceDir, m_CI.getCodeGenOpts().MainFileName);
+      }
 
       if (request.Global) {
         auto deriveResult = m_DerivativeBuilder->Derive(request);
@@ -375,10 +778,8 @@ void InitTimers();
       const FunctionDecl* FD = request.Function;
       ASTContext& C = S.getASTContext();
       clang::PrintingPolicy Policy = C.getPrintingPolicy();
-#if CLANG_VERSION_MAJOR > 10
       // Our testsuite expects 'a<b<c> >' rather than 'a<b<c>>'.
       Policy.SplitTemplateClosers = true;
-#endif
       // if enabled, print source code of the original functions
       if (m_DO.DumpSourceFn) {
         FD->print(llvm::outs(), Policy);
@@ -386,6 +787,10 @@ void InitTimers();
       // if enabled, print ASTs of the original functions
       if (m_DO.DumpSourceFnAST)
         FD->dumpColor();
+
+      // if enabled, report what each parameter's writes were proven to cover
+      if (m_DO.DumpLoopAnalysis)
+        printWrittenExtents(request);
 
       // If enabled, set the proper fields in derivative builder.
       if (m_DO.PrintNumDiffErrorInfo) {
@@ -435,6 +840,20 @@ void InitTimers();
       if (DerivativeDecl) {
         if (!alreadyDerived &&
             (!request.CustomDerivative || request.CallUpdateRequired)) {
+          // Reported on at the end of the unit rather than here: reading a
+          // buffer settles where its lines are, so everything has to be
+          // printed into it first.
+          Generated G;
+          G.Derivative = DerivativeDecl;
+          G.AnalysisRan = request.EnableTBRAnalysis;
+          // Where a user asked for this derivative, when one did. Clad asks
+          // for some itself -- the second derivative a hessian needs -- and
+          // those were written on no line at all.
+          if (request.CallContext && request.Function) {
+            G.Original = request.Function;
+            G.RequestedAt = request.CallContext->getBeginLoc();
+          }
+          m_Generated.push_back(G);
           printDerivative(DerivativeDecl, request.DeclarationOnly, m_DO);
 
           S.MarkFunctionReferenced(SourceLocation(), DerivativeDecl);
@@ -565,48 +984,19 @@ void InitTimers();
       return m_HasRuntime;
     }
 
-    static void SetTBRAnalysisOptions(const DifferentiationOptions& DO,
-                                      RequestOptions& opts) {
-      // If user has explicitly specified the mode for TBR analysis, use it.
-      if (DO.EnableTBRAnalysis || DO.DisableTBRAnalysis)
-        opts.EnableTBRAnalysis = DO.EnableTBRAnalysis && !DO.DisableTBRAnalysis;
-      else
-        opts.EnableTBRAnalysis = true; // Default mode.
-    }
-
-    static void SetActivityAnalysisOptions(const DifferentiationOptions& DO,
-                                           RequestOptions& opts) {
-      // If user has explicitly specified the mode for AA, use it.
-      if (DO.EnableVariedAnalysis || DO.DisableVariedAnalysis)
-        opts.EnableVariedAnalysis =
-            DO.EnableVariedAnalysis && !DO.DisableVariedAnalysis;
-      else
-        opts.EnableVariedAnalysis = false; // Default mode.
-    }
-
-    static void SetUsefulAnalysisOptions(const DifferentiationOptions& DO,
-                                         RequestOptions& opts) {
-      // If user has explicitly specified the mode for TBR analysis, use it.
-      if (DO.EnableUsefulAnalysis || DO.DisableUsefulAnalysis)
-        opts.EnableUsefulAnalysis =
-            DO.EnableUsefulAnalysis && !DO.DisableUsefulAnalysis;
-      else
-        opts.EnableUsefulAnalysis = false; // Default mode.
-    }
-    void CladPlugin::SetRequestOptions(RequestOptions& opts) const {
-      SetTBRAnalysisOptions(m_DO, opts);
-      SetActivityAnalysisOptions(m_DO, opts);
-      SetUsefulAnalysisOptions(m_DO, opts);
-      opts.EmitPortingHints = m_DO.EmitPortingHints;
+    DerivativePrinter& CladPlugin::getDerivativePrinter() {
+      assert(m_DerivativeBuilder &&
+             "asked to print before anything was derived");
+      if (!m_DerivativePrinter)
+        m_DerivativePrinter = std::make_unique<DerivativePrinter>(
+            m_CI.getSema(), m_DerivativeBuilder->getGeneratedCode());
+      return *m_DerivativePrinter;
     }
 
     DiffScheduler& CladPlugin::getScheduler() {
-      if (!m_Scheduler) {
-        RequestOptions Opts{};
-        SetRequestOptions(Opts);
-        m_Scheduler = std::make_unique<DiffScheduler>(m_CI.getSema(), Opts,
+      if (!m_Scheduler)
+        m_Scheduler = std::make_unique<DiffScheduler>(m_CI.getSema(), m_DO,
                                                       CladEnabledRange);
-      }
       return *m_Scheduler;
     }
 
@@ -671,6 +1061,9 @@ void InitTimers();
         }
 
         FinalizeTranslationUnit();
+        // Before the multiplexer: this is the last point at which every
+        // derivative exists and none has reached code generation.
+        materializeGeneratedCode();
         SendToMultiplexer();
       }
       if (m_Multiplexer)

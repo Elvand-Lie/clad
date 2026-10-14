@@ -56,6 +56,7 @@ template <class C, class Tr>
 class CLAD_NONDIFFERENTIABLE Tag<::std::basic_ios<C, Tr>> {};
 template <> class CLAD_NONDIFFERENTIABLE Tag<::std::ios_base> {};
 
+/// \ingroup rules
 namespace custom_derivatives {
 
 namespace helpers {
@@ -519,6 +520,23 @@ void push_back_pullback(::std::vector<T>* v, U val, ::std::vector<T>* d_v,
                         pU* d_val) {
   *d_val += d_v->back();
   d_v->pop_back();
+}
+
+template <typename T>
+void resize_reverse_forw(::std::vector<T>* v,
+                         typename ::std::vector<T>::size_type sz,
+                         ::std::vector<T>* d_v,
+                         typename ::std::vector<T>::size_type /*d_sz*/) {
+  v->resize(sz);
+  d_v->resize(sz);
+}
+
+template <typename T>
+void resize_pullback(::std::vector<T>* v,
+                     typename ::std::vector<T>::size_type /*sz*/,
+                     ::std::vector<T>* d_v,
+                     typename ::std::vector<T>::size_type* /*d_sz*/) {
+  d_v->resize(v->size());
 }
 
 template <typename T>

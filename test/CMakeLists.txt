@@ -77,6 +77,13 @@ set(CLAD_TEST_PARAMS
 # Unit tests
 list(APPEND CLAD_TEST_DEPS CladUnitTests)
 
+# TableIsWellFormed runs clad-tblgen against deliberately broken tables, so the
+# suite needs the renderer. A cross build was given one already built for the
+# host, and has no target to wait on.
+if(TARGET clad-tblgen)
+  list(APPEND CLAD_TEST_DEPS clad-tblgen)
+endif()
+
 add_custom_target(clad-test-depends DEPENDS ${CLAD_TEST_DEPS})
 set_target_properties(clad-test-depends PROPERTIES FOLDER "Clad tests")
 
@@ -88,10 +95,14 @@ endif()
 
 option(CLAD_CUDA_TEST_USE_SANITIZER "Run Clang cuda tests with compute-sanitizer" OFF)
 option(CLAD_TEST_USE_VG "Run Clang tests under Valgrind" OFF)
+option(CLAD_TEST_VG_EXEC_ONLY "Run the programs the tests produce under Valgrind" OFF)
 set(CLAD_TEST_EXTRA_ARGS --verbose --show-skipped --show-unsupported)
 if(CLAD_TEST_USE_VG)
   set(CLAD_TEST_EXTRA_ARGS ${CLAD_TEST_EXTRA_ARGS}
       "--vg --vg-arg=-q --vg-arg=--suppressions=${CMAKE_CURRENT_SOURCE_DIR}/clad-valgrind-llvm22.supp")
+endif ()
+if(CLAD_TEST_VG_EXEC_ONLY)
+  set(CLAD_TEST_EXTRA_ARGS ${CLAD_TEST_EXTRA_ARGS} "--param" "vg_exec_only=1")
 endif ()
 if(CLAD_CUDA_TEST_USE_SANITIZER)
   set(CLAD_TEST_EXTRA_ARGS ${CLAD_TEST_EXTRA_ARGS} "--param" "cuda_sanitizer=1")

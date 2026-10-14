@@ -6,13 +6,16 @@
 // File originates from the Scout project (http://scout.zih.tu-dresden.de/)
 
 #include "clad/Differentiator/StmtClone.h"
+#include "clad/Differentiator/CladUtils.h"
 #include "clad/Differentiator/Compatibility.h"
 
+#include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/Stmt.h"
 #include "clang/Sema/Lookup.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
 
@@ -269,7 +272,8 @@ DEFINE_CLONE_EXPR(GNUNullExpr,
 DEFINE_CLONE_EXPR(VAArgExpr,
                   (Node->getBuiltinLoc(), Clone(Node->getSubExpr()),
                    Node->getWrittenTypeInfo(), Node->getRParenLoc(),
-                   CloneType(Node->getType()), Node->isMicrosoftABI()))
+                   CloneType(Node->getType()),
+                   CLAD_COMPAT_CLANG23_VAArgExpr_VarArgKind_Param(Node)))
 DEFINE_CLONE_EXPR(ImplicitValueInitExpr, (CloneType(Node->getType())))
 DEFINE_CLONE_EXPR(CXXScalarValueInitExpr,
                   (CloneType(Node->getType()), Node->getTypeSourceInfo(),
@@ -293,13 +297,23 @@ DEFINE_CLONE_EXPR(SubstNonTypeTemplateParmExpr,
                    Node->getBeginLoc(), Clone(Node->getReplacement()),
                    Node->getAssociatedDecl(), Node->getIndex(),
                    Node->getPackIndex(), Node->isReferenceParameter()))
-#else
+#elif CLANG_VERSION_MAJOR < 23
 DEFINE_CLONE_EXPR(SubstNonTypeTemplateParmExpr,
                   (CloneType(Node->getType()), Node->getValueKind(),
                    Node->getBeginLoc(), Clone(Node->getReplacement()),
                    Node->getAssociatedDecl(), Node->getIndex(),
                    Node->getPackIndex(), Node->isReferenceParameter(),
                    Node->getFinal()))
+#else
+// Clang 23 stores the parameter's type where the reference-ness bit used to
+// sit, so isReferenceParameter() is gone and the type takes its place in the
+// argument list.
+DEFINE_CLONE_EXPR(SubstNonTypeTemplateParmExpr,
+                  (CloneType(Node->getType()), Node->getValueKind(),
+                   Node->getBeginLoc(), Clone(Node->getReplacement()),
+                   Node->getAssociatedDecl(),
+                   CloneType(Node->getParameterType()), Node->getIndex(),
+                   Node->getPackIndex(), Node->getFinal()))
 #endif
 // A PseudoObjectExpr (e.g. a `threadIdx.x` __declspec(property) access) binds
 // OpaqueValueExprs in its semantic expressions and references those same OVE
@@ -308,6 +322,94 @@ DEFINE_CLONE_EXPR(SubstNonTypeTemplateParmExpr,
 // form to them via m_OVESubst, so the clone shares no node with the original.
 // Passing the original subtrees to Create (as a plain DEFINE_CREATE_EXPR would)
 // splices them, and two such clones (forward + reverse sweep) then share nodes.
+Stmt* StmtClone::VisitBinaryConditionalOperator(
+    BinaryConditionalOperator* Node) {
+  // `a ?: b` evaluates `a` once and names it with an OpaqueValueExpr that the
+  // condition and the true branch both point at. Cloning those sub-expressions
+  // directly would leave them pointing at the original's opaque value, so bind
+  // a clone of it first and let VisitOpaqueValueExpr substitute it, the way
+  // VisitPseudoObjectExpr does.
+  llvm::DenseMap<OpaqueValueExpr*, OpaqueValueExpr*> LocalSubst;
+  auto* SavedSubst = m_OVESubst;
+  if (!m_OVESubst)
+    m_OVESubst = &LocalSubst;
+
+  // The opaque value's source and the common sub-expression are the same node,
+  // and BinaryConditionalOperator's constructor asserts as much, so clone it
+  // once and give both the one clone.
+  OpaqueValueExpr* OVE = Node->getOpaqueValue();
+  auto* common = cast<Expr>(Clone(Node->getCommon()));
+  auto* clonedOVE = new (Ctx)
+      OpaqueValueExpr(OVE->getLocation(), CloneType(OVE->getType()),
+                      OVE->getValueKind(), OVE->getObjectKind(), common);
+  // Carry the dependence across, as VisitOpaqueValueExpr does for the opaque
+  // values it clones itself.
+  clad_compat::ExprSetDeps(clonedOVE, OVE);
+  (*m_OVESubst)[OVE] = clonedOVE;
+
+  auto* result = new (Ctx) BinaryConditionalOperator(
+      common, clonedOVE, cast<Expr>(Clone(Node->getCond())),
+      cast<Expr>(Clone(Node->getTrueExpr())),
+      cast<Expr>(Clone(Node->getFalseExpr())), Node->getQuestionLoc(),
+      Node->getColonLoc(), CloneType(Node->getType()), Node->getValueKind(),
+      Node->getObjectKind());
+  clad_compat::ExprSetDeps(result, Node);
+
+  m_OVESubst = SavedSubst;
+  return result;
+}
+
+Stmt* StmtClone::VisitCXXInheritedCtorInitExpr(CXXInheritedCtorInitExpr* Node) {
+  // The inherited constructor is named, not called here -- the node carries no
+  // argument sub-expressions of its own, so there is nothing to clone into it.
+  auto* result = new (Ctx) CXXInheritedCtorInitExpr(
+      Node->getLocation(), CloneType(Node->getType()), Node->getConstructor(),
+      Node->constructsVBase(), Node->inheritedFromVBase());
+  clad_compat::ExprSetDeps(result, Node);
+  return result;
+}
+
+#if CLANG_VERSION_MAJOR >= 16
+Stmt* StmtClone::VisitCXXParenListInitExpr(CXXParenListInitExpr* Node) {
+  // An array initialised this way does not survive being cloned: the array
+  // path elsewhere in clad recognises InitListExpr and not this node, so even
+  // a faithful clone reaches Sema as an element initialiser carrying the whole
+  // array's type, and the user is told their own line cannot initialise an
+  // array element. Report that clad cannot clone it, which is true and says
+  // whose problem it is, and leave arrays to whoever teaches that path about
+  // this node. Aggregates and unions are unaffected.
+  if (Node->getType()->isArrayType())
+    return VisitStmt(Node);
+
+  llvm::SmallVector<Expr*, 4> inits;
+  inits.reserve(Node->getInitExprs().size());
+  for (Expr* init : Node->getInitExprs())
+    inits.push_back(init ? cast<Expr>(Clone(init)) : nullptr);
+
+  auto* result = CXXParenListInitExpr::Create(
+      Ctx, inits, CloneType(Node->getType()),
+      Node->getUserSpecifiedInitExprs().size(), Node->getInitLoc(),
+      Node->getBeginLoc(), Node->getEndLoc());
+  // The array filler and the union's initialized field share one storage slot,
+  // so at most one of them is set and setting either overwrites the other.
+  // Dropping the field leaves CodeGen reading a union with no member chosen,
+  // which is the same crash by another road.
+  if (Expr* filler = Node->getArrayFiller())
+    result->setArrayFiller(cast<Expr>(Clone(filler)));
+  else if (FieldDecl* fieldInUnion = Node->getInitializedFieldInUnion())
+    result->setInitializedFieldInUnion(fieldInUnion);
+  clad_compat::ExprSetDeps(result, Node);
+  return result;
+}
+#endif // CLANG_VERSION_MAJOR >= 16
+
+Stmt* StmtClone::VisitAttributedStmt(AttributedStmt* Node) {
+  // The attributes are immutable and shared by design, so the clone carries
+  // the same ones; only the statement they are attached to is cloned.
+  return AttributedStmt::Create(Ctx, Node->getAttrLoc(), Node->getAttrs(),
+                                Clone(Node->getSubStmt()));
+}
+
 Stmt* StmtClone::VisitPseudoObjectExpr(PseudoObjectExpr* Node) {
   llvm::DenseMap<OpaqueValueExpr*, OpaqueValueExpr*> LocalSubst;
   auto* SavedSubst = m_OVESubst;
@@ -404,7 +506,10 @@ Stmt* StmtClone::VisitInitListExpr(InitListExpr* Node) {
   // node: preserve the type, the array filler and the union field so aggregate
   // emission stays valid.
   auto* result = new (Ctx)
-      InitListExpr(Ctx, Node->getLBraceLoc(), initExprs, Node->getRBraceLoc());
+      InitListExpr(Ctx, Node->getLBraceLoc(), initExprs,
+                   Node->getRBraceLoc()
+                       CLAD_COMPAT_CLANG23_InitListExpr_IsExplicit_ExtraParam(
+                           Node->isExplicit()));
   result->setType(CloneType(Node->getType()));
   if (Expr* filler = Node->getArrayFiller())
     result->setArrayFiller(Clone(filler));
@@ -633,6 +738,12 @@ Decl* StmtClone::CloneDecl(Decl* Node)  {
     // cloned_Decl->setDeclaredInCondition(VD->isDeclaredInCondition());
     return cloned_Decl;
   }
+  // An alias declares no storage and holds no initializer to remap, so a
+  // re-declaration of the same written type is a complete copy.
+  if (auto* TND = dyn_cast<TypedefNameDecl>(Node))
+    return utils::BuildTypedefNameDecl(Ctx, TND->getDeclContext(),
+                                       TND->getBeginLoc(), TND->getLocation(),
+                                       TND);
   assert(0 && "other decl clones aren't supported");
   return 0;
 }
@@ -653,9 +764,21 @@ Stmt* StmtClone::VisitDeclStmt(DeclStmt* Node) {
   return new (Ctx) DeclStmt(clonedDecls, Node->getBeginLoc(), Node->getEndLoc());
 }
 
-Stmt* StmtClone::VisitStmt(Stmt*) {
-  assert(0 && "clone not fully implemented");
-  return 0;
+Stmt* StmtClone::VisitStmt(Stmt* Node) {
+  // A kind with no case above has no clone to give. Returning null hands the
+  // caller something it cannot put in a tree and cannot detect -- the assert
+  // says so in a debug build and NDEBUG removes it, which is how an
+  // unimplemented kind became a segfault in ReferencesUpdater rather than a
+  // message. Say it instead, as an error: clad cannot build this derivative,
+  // and an error stops the compilation before anything reads what is returned.
+  // The placeholder exists only so the tree stays well formed until then.
+  utils::diag(m_Sema, DiagnosticsEngine::Error, Node->getBeginLoc(),
+              "clad cannot differentiate this function: no clone exists for "
+              "statement kind '%0'")
+      << Node->getStmtClassName();
+  if (auto* E = dyn_cast<Expr>(Node))
+    return new (Ctx) ImplicitValueInitExpr(CloneType(E->getType()));
+  return new (Ctx) NullStmt(Node->getBeginLoc());
 }
 
 ReferencesUpdater::ReferencesUpdater(

@@ -1,12 +1,15 @@
 #include "clad/Differentiator/CladUtils.h"
+
 #include "clad/Differentiator/Compatibility.h"
 
 #include "ConstantFolder.h"
+#include "Diagnostics.h"
 
 #include "clang/AST/APValue.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclAccessPair.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/Expr.h"
@@ -15,6 +18,7 @@
 #include "clang/AST/ParentMapContext.h"
 #include "clang/AST/QualTypeNames.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/Stmt.h"
 #include "clang/AST/TemplateName.h"
 #include "clang/AST/Type.h"
 #include "clang/Analysis/AnalysisDeclContext.h"
@@ -25,20 +29,42 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/Specifiers.h"
 #include "clang/Sema/Lookup.h"
+#include "clang/Sema/Overload.h"
+#include "clang/Sema/Ownership.h"
 #include "clang/Sema/Sema.h"
 #include "clang/Sema/TemplateDeduction.h"
 
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APSInt.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
 
 #include <memory>
+#include <set>
 #include <vector>
 
 using namespace clang;
 namespace clad {
   namespace utils {
+
+  clang::Sema::SemaDiagnosticBuilder diag(clang::Sema& S, CladDiag D,
+                                          clang::SourceLocation Loc) {
+    unsigned ID =
+        S.Diags.getDiagnosticIDs()->getCustomDiagID(severityOf(D), textOf(D));
+    return S.Diag(Loc, ID);
+  }
+  const Stmt* SkipLikelihoodHints(const Stmt* S) {
+    while (const auto* AS = dyn_cast<AttributedStmt>(S)) {
+      for (const Attr* A : AS->getAttrs())
+        if (!isa<LikelyAttr, UnlikelyAttr>(A))
+          return S;
+      S = AS->getSubStmt();
+    }
+    return S;
+  }
+
     static SourceLocation noLoc{};
 
     std::string ComputeEffectiveFnName(const FunctionDecl* FD) {
@@ -305,6 +331,138 @@ namespace clad {
       return Result;
     }
 
+    /// Whether code in `Where` can name `T` as it is spelled. decltype and
+    /// typeof sugar is spelled as its expression, whose names may resolve only
+    /// where it was written. A pointer or function type is as nameable as its
+    /// parts. Otherwise what has to be reachable is the head
+    /// of the spelling -- the typedef, using declaration or tag it names: not
+    /// local to a function `Where` is outside of; where it is a non-public
+    /// member, declared in a class enclosing `Where`; and where it prints
+    /// unqualified, declared in a scope enclosing `Where`.
+    static bool isSpellableFrom(QualType T, const DeclContext* Where) {
+      const NamedDecl* D = nullptr;
+      bool Unqualified = false;
+      const Type* Ty = T.getTypePtr();
+      for (;;) {
+        if (isa<DecltypeType, TypeOfExprType>(Ty))
+          return false;
+#if CLANG_VERSION_MAJOR >= 22
+        // The size_t clang gives sizeof prints as __size_t, which no code
+        // declares (llvm/llvm-project#143653).
+        if (isa<PredefinedSugarType>(Ty))
+          return false;
+#endif
+        D = clad_compat::getSpelledName(Ty, Unqualified);
+        if (D)
+          break;
+        QualType Next = Ty->getLocallyUnqualifiedSingleStepDesugaredType();
+        if (Next.getTypePtr() == Ty)
+          break;
+        Ty = Next.getTypePtr();
+      }
+      auto IsSpellable = [Where](QualType P) {
+        return isSpellableFrom(P, Where);
+      };
+      if (const auto* PT = dyn_cast<PointerType>(Ty))
+        return IsSpellable(PT->getPointeeType());
+      if (const auto* FPT = dyn_cast<FunctionProtoType>(Ty))
+        return IsSpellable(FPT->getReturnType()) &&
+               llvm::all_of(FPT->param_types(), IsSpellable);
+      if (D && Unqualified) {
+        // Inline and anonymous namespaces, and linkage specifications, make
+        // their names visible in the enclosing scope.
+        const DeclContext* DC = D->getDeclContext()->getRedeclContext();
+        while (const auto* NS = dyn_cast<NamespaceDecl>(DC)) {
+          if (!NS->isInline() && !NS->isAnonymousNamespace())
+            break;
+          DC = NS->getParent()->getRedeclContext();
+        }
+        if (Where ? !DC->Encloses(Where) : !DC->isTranslationUnit())
+          return false;
+      }
+      for (; D; D = dyn_cast<NamedDecl>(D->getDeclContext())) {
+        const DeclContext* DC = D->getDeclContext();
+        if (DC->isFunctionOrMethod() && !(Where && DC->Encloses(Where)))
+          return false;
+        AccessSpecifier AS = D->getAccess();
+        if (AS != AS_public && AS != AS_none && !(Where && DC->Encloses(Where)))
+          return false;
+      }
+      return true;
+    }
+
+    Expr*
+    BuildDeclarationNameExpr(Sema& S, const CXXScopeSpec& SS, LookupResult& R,
+                             bool ADL,
+                             const TemplateArgumentListInfo* TemplateArgs) {
+      if (!TemplateArgs)
+        return S.BuildDeclarationNameExpr(SS, R, ADL).get();
+      // Clang drops, without a word, template arguments whose angle brackets
+      // have no location.
+      assert(TemplateArgs->getLAngleLoc().isValid() &&
+             "template arguments need a location");
+      return S
+          .BuildTemplateIdExpr(SS, /*TemplateKWLoc=*/{}, R, ADL, TemplateArgs)
+          .get();
+    }
+
+    QualType getUnsignedType(QualType T, const ASTContext& C) {
+      T = T.getNonReferenceType().getUnqualifiedType();
+      if (clad_compat::isPromotableIntegerType(C, T))
+        T = C.getPromotedIntegerType(T);
+      return T->isUnsignedIntegerType() ? T : C.getCorrespondingUnsignedType(T);
+    }
+
+    QualType getSpellableType(QualType T, const DeclContext* Where,
+                              const ASTContext& C) {
+      for (QualType Cur = T;;) {
+        if (isSpellableFrom(Cur, Where))
+          return Cur;
+        QualType Next = Cur.getSingleStepDesugaredType(C);
+        if (Next != Cur) {
+          Cur = Next;
+          continue;
+        }
+        // No sugar is left to choose from: spell the parts instead.
+        auto Spell = [&](QualType P) { return getSpellableType(P, Where, C); };
+        const Type* Ty = Cur.getTypePtr();
+        QualType R;
+        if (const auto* PT = dyn_cast<PointerType>(Ty)) {
+          R = C.getPointerType(Spell(PT->getPointeeType()));
+        } else if (const auto* FPT = dyn_cast<FunctionProtoType>(Ty)) {
+          llvm::SmallVector<QualType, 4> Params;
+          for (QualType P : FPT->param_types())
+            Params.push_back(Spell(P));
+          R = C.getFunctionType(Spell(FPT->getReturnType()), Params,
+                                FPT->getExtProtoInfo());
+        } else {
+          return T;
+        }
+        return C.getQualifiedType(R, Cur.getLocalQualifiers());
+      }
+    }
+
+    FunctionDecl* ResolveOverload(Sema& S, Expr* lookup,
+                                  llvm::MutableArrayRef<Expr*> args) {
+      OverloadCandidateSet Candidates(noLoc, OverloadCandidateSet::CSK_Normal);
+      if (lookup->hasPlaceholderType(BuiltinType::Overload)) {
+        auto* ULE =
+            cast<UnresolvedLookupExpr>(OverloadExpr::find(lookup).Expression);
+        ExprResult result;
+        S.buildOverloadedCallSet(S.getScopeForContext(S.CurContext), lookup,
+                                 ULE, args, noLoc, &Candidates, &result);
+      } else {
+        auto* FD = cast<FunctionDecl>(cast<DeclRefExpr>(lookup)->getDecl());
+        S.AddOverloadCandidate(FD, DeclAccessPair::make(FD, AS_public), args,
+                               Candidates);
+      }
+      OverloadCandidateSet::iterator Best = nullptr;
+      if (Candidates.BestViableFunction(S, lookup->getExprLoc(), Best) !=
+          OR_Success)
+        return nullptr;
+      return Best->Function;
+    }
+
     NamespaceDecl* LookupNSD(Sema& S, llvm::StringRef namespc, bool shouldExist,
                              DeclContext* DC) {
       ASTContext& C = S.getASTContext();
@@ -340,6 +498,27 @@ namespace clad {
 
     bool isArrayOrPointerType(clang::QualType QT) {
       return QT->isArrayType() || QT->isPointerType();
+    }
+
+    bool canUseHessianVectorProducts(const clang::FunctionDecl* FD) {
+      // The wrapper passes tangents and adjoints by position and the hessian
+      // matrix has no place for `this`.
+      if (const auto* MD = dyn_cast<CXXMethodDecl>(FD))
+        if (MD->isInstance())
+          return false;
+      for (const ParmVarDecl* PVD : FD->parameters()) {
+        QualType T = PVD->getType();
+        // The wrapper needs one tangent per parameter: a parameter the
+        // pushforward's signature filter skips leaves the wrapper and the
+        // pushforward disagreeing on positions.
+        if (!IsDifferentiableType(T))
+          return false;
+        // A reference tangent can be neither reseeded between directions nor
+        // zero-initialized for a parameter no direction runs through.
+        if (T->isReferenceType())
+          return false;
+      }
+      return true;
     }
 
     bool isLinearConstructor(const clang::CXXConstructorDecl* CD,
@@ -489,6 +668,14 @@ namespace clad {
       ParmVarDecl* PVD =
           ParmVarDecl::Create(C, DC, Loc, Loc, II, T, TSI, SC, defArg);
       return PVD;
+    }
+
+    void SetParams(FunctionDecl* FD, llvm::ArrayRef<ParmVarDecl*> params) {
+      FD->setParams(params);
+      // Scope depth is 0: these belong to a plain function, not to a nested
+      // function prototype.
+      for (unsigned i = 0; i < params.size(); ++i)
+        params[i]->setScopeInfo(/*scopeDepth=*/0, /*parameterIndex=*/i);
     }
 
     clang::QualType GetValueType(clang::QualType T) {
@@ -885,7 +1072,7 @@ namespace clad {
         auto OpKind = UO->getOpcode();
         if (OpKind == UO_Plus || OpKind == UO_Minus)
           return UsefulToStore(UO->getSubExpr());
-        return false;
+        return UO->isIncrementDecrementOp();
       }
       if (const auto* ASE = dyn_cast<ArraySubscriptExpr>(E))
         return UsefulToStore(ASE->getBase()) || UsefulToStore(ASE->getIdx());
@@ -953,11 +1140,7 @@ namespace clad {
     bool IsMemoryDeallocationFunction(const clang::FunctionDecl* FD) {
       if (FD->getNameAsString() == "cudaFree")
         return true;
-#if CLANG_VERSION_MAJOR > 12
       return FD->getBuiltinID() == Builtin::ID::BIfree;
-#else
-      return FD->getNameAsString() == "free";
-#endif
     }
 
     bool isNonConstReferenceType(clang::QualType QT) {
@@ -965,8 +1148,47 @@ namespace clad {
              !QT.getNonReferenceType().isConstQualified();
     }
 
+    bool CanReturnOutputTangent(const clang::FunctionDecl* FD) {
+      if (!FD->getReturnType()->isVoidType())
+        return false;
+      const auto* MD = dyn_cast<clang::CXXMethodDecl>(FD);
+      return !MD || MD->isStatic();
+    }
+
+    void CollectOutputParams(
+        const clang::FunctionDecl* FD,
+        llvm::SmallVectorImpl<const clang::ParmVarDecl*>& outputParams) {
+      for (const clang::ParmVarDecl* PVD : FD->parameters()) {
+        clang::QualType T = PVD->getType();
+        if (!T->isLValueReferenceType() || !isNonConstReferenceType(T))
+          continue;
+        // Floating point, not isRealType: that is also true of an integer and
+        // of a complete unscoped enum, and neither is a tangent anyone asked
+        // for. Counting them costs twice. An enum is not differentiable, so no
+        // tangent is ever built for it and asking for one later finds nothing;
+        // and an `int&` a function writes its iteration count through would
+        // make an ordinary one-output function look like it has two. The
+        // traits side asks std::is_floating_point, and the two have to agree.
+        if (T.getNonReferenceType()->isRealFloatingType())
+          outputParams.push_back(PVD);
+      }
+    }
+
     bool isCopyable(const clang::CXXRecordDecl* RD) {
       if (RD->defaultedCopyConstructorIsDeleted())
+        return false;
+      // Not copyable if every declared copy ctor is deleted or non-public.
+      // (A type may still be copyable if it has another public copy ctor.)
+      bool sawCopyCtor = false;
+      bool hasUsableCopyCtor = false;
+      for (const clang::CXXConstructorDecl* Ctor : RD->ctors()) {
+        if (!Ctor->isCopyConstructor())
+          continue;
+        sawCopyCtor = true;
+        if (!Ctor->isDeleted() && Ctor->getAccess() == clang::AS_public)
+          hasUsableCopyCtor = true;
+      }
+      if (sawCopyCtor && !hasUsableCopyCtor)
         return false;
       if (RD->hasUserDeclaredCopyConstructor()) {
         std::string qualifiedName = RD->getQualifiedNameAsString();
@@ -989,6 +1211,10 @@ namespace clad {
       assert(!CladR.empty() && "cannot find clad namespace");
       Result = cast<NamespaceDecl>(CladR.getFoundDecl());
       return Result;
+    }
+
+    LookupResult tryLookupCladMethod(Sema& S, llvm::StringRef name) {
+      return LookupQualifiedName(name, S, GetCladNamespace(S));
     }
 
     Expr* getZeroInit(QualType T, Sema& S) {
@@ -1126,8 +1352,7 @@ namespace clad {
 
           // Instantiation with the required signature succeeded.
           if (TDK == clad_compat::CLAD_COMPAT_TemplateSuccess)
-            return S.BuildDeclarationNameExpr(SS, Overloads, /*ADL=*/false)
-                .get();
+            return BuildDeclarationNameExpr(S, SS, Overloads);
 
           FailedCandidates.addCandidate().set(
               I.getPair(), FTD->getTemplatedDecl(),
@@ -1137,15 +1362,14 @@ namespace clad {
           // deduction successful because of the auto return type.
           if (Specialization && !Specialization->isTemplated() &&
               Specialization->getReturnType()->isUndeducedAutoType())
-            return S.BuildDeclarationNameExpr(SS, Overloads, /*ADL=*/false)
-                .get();
+            return BuildDeclarationNameExpr(S, SS, Overloads);
         }
         auto* FD = dyn_cast<FunctionDecl>(candidate);
         if (!FD)
           continue;
         // Overload is just a FunctionDecl, check if the signature matches.
         if (MatchFunctionTypeWithQualifiedParams(S, FnTy, FD->getType()))
-          return S.BuildDeclarationNameExpr(SS, Overloads, /*ADL=*/false).get();
+          return BuildDeclarationNameExpr(S, SS, Overloads);
       }
       return nullptr;
     }
@@ -1177,6 +1401,12 @@ namespace clad {
       }
     }
 
+    bool returnsAdjoint(QualType T) {
+      if (T->isPointerType())
+        return true;
+      return isMemoryType(T);
+    }
+
     bool isMemoryType(QualType T) {
       T = T.getCanonicalType();
       if (T->isReferenceType())
@@ -1198,6 +1428,14 @@ namespace clad {
         return false;
       }
       return false;
+    }
+
+    FunctionDecl* LookupCladZeroLike(Sema& S, Expr* value) {
+      LookupResult R = tryLookupCladMethod(S, "zero_like");
+      CXXScopeSpec CSS;
+      Expr* lookup = BuildDeclarationNameExpr(S, CSS, R);
+      llvm::SmallVector<Expr*, 1> args{value};
+      return ResolveOverload(S, lookup, args);
     }
 
     bool shouldUseRestoreTracker(const FunctionDecl* FD) {
@@ -1424,8 +1662,27 @@ namespace clad {
                       bool forCustomDerv, bool shouldUseRestoreTracker,
                       bool isForErrorEstimation) {
       ASTContext& C = S.getASTContext();
-      if (mode == DiffMode::forward)
+      if (mode == DiffMode::forward) {
+        // A function returning void leaves its result in a parameter, and the
+        // tangent of that parameter is the only thing its derivative has to
+        // give back. Returning it is what keeps the derivative reachable: the
+        // signature is otherwise the primal's, so the tangent would be a local
+        // the caller cannot read. More than one such parameter is left to the
+        // caller of this function to diagnose -- there is no way to choose.
+        if (utils::CanReturnOutputTangent(FD)) {
+          llvm::SmallVector<const clang::ParmVarDecl*, 2> outputParams;
+          utils::CollectOutputParams(FD, outputParams);
+          // getAs looks through the sugar an attributed function type adds.
+          const auto* FnProtoTy = FD->getType()->getAs<FunctionProtoType>();
+          if (outputParams.size() == 1 && FnProtoTy) {
+            QualType dRetTy = utils::getNonConstType(
+                outputParams.front()->getType().getNonReferenceType(), S);
+            return C.getFunctionType(dRetTy, FnProtoTy->getParamTypes(),
+                                     FnProtoTy->getExtProtoInfo());
+          }
+        }
         return FD->getType();
+      }
 
       QualType FnTy = FD->getType();
 
@@ -1457,11 +1714,11 @@ namespace clad {
                         mode == DiffMode::pullback ||
                         mode == DiffMode::vector_forward_mode;
       if (mode == DiffMode::reverse_mode_forward_pass) {
-        if (isMemoryType(oRetTy) || isa<CXXConstructorDecl>(FD)) {
+        if (returnsAdjoint(oRetTy) || isa<CXXConstructorDecl>(FD)) {
           TemplateDecl* valAndAdjointTempDecl =
               utils::LookupTemplateDeclInCladNamespace(S, "ValueAndAdjoint");
-          dRetTy = utils::InstantiateTemplate(S, valAndAdjointTempDecl,
-                                              {oRetTy, oRetTy});
+          dRetTy = utils::InstantiateTemplate(
+              S, valAndAdjointTempDecl, {oRetTy, getNonConstType(oRetTy, S)});
         } else {
           dRetTy = oRetTy;
         }
@@ -1888,12 +2145,33 @@ namespace clad {
         // If the parent is a Stmt but not an Expr, then the result is not used.
         if (!S)
           return false;
+        // A call returned directly is still consumed by the enclosing
+        // function, including its value and adjoint in reverse_forw mode.
+        if (isa<ReturnStmt>(S))
+          return false;
         E = dyn_cast<Expr>(S);
         if (!E)
           return true;
         // If we're dealing with an implicit expr (e.g. ExprWithCleanups),
         // go up to get more information.
       } while (E->IgnoreImplicit() != E);
+      return false;
+    }
+    bool isCUDABuiltinVariable(const clang::Expr* E,
+                               const clang::ASTContext& Context) {
+      if (const auto* DRE = clang::dyn_cast<clang::DeclRefExpr>(E)) {
+        const clang::ValueDecl* VD = DRE->getDecl();
+        const clang::IdentifierInfo* II = VD->getIdentifier();
+        if (!II)
+          return false;
+        llvm::StringRef Name = II->getName();
+
+        if (Name == "threadIdx" || Name == "blockIdx" || Name == "blockDim" ||
+            Name == "gridDim") {
+          const clang::SourceManager& SM = Context.getSourceManager();
+          return SM.isInSystemHeader(VD->getLocation());
+        }
+      }
       return false;
     }
 
@@ -1914,6 +2192,18 @@ namespace clad {
       return false;
     }
 
+    TypedefNameDecl* BuildTypedefNameDecl(ASTContext& C, DeclContext* DC,
+                                          SourceLocation StartLoc,
+                                          SourceLocation IdLoc,
+                                          const TypedefNameDecl* TND) {
+      TypeSourceInfo* TSI = TND->getTypeSourceInfo();
+      if (isa<TypeAliasDecl>(TND))
+        return TypeAliasDecl::Create(C, DC, StartLoc, IdLoc,
+                                     TND->getIdentifier(), TSI);
+      return TypedefDecl::Create(C, DC, StartLoc, IdLoc, TND->getIdentifier(),
+                                 TSI);
+    }
+
     Expr* BuildEnzymeActivityMarkerRef(Sema& semaRef, llvm::StringRef name) {
       ASTContext& C = semaRef.getASTContext();
       DeclarationName DN = &C.Idents.get(name);
@@ -1929,6 +2219,78 @@ namespace clad {
     bool ShouldRecompute(const Expr* E, const ASTContext& C) {
       return !(utils::ContainsFunctionCalls(E) || E->HasSideEffects(C)) ||
              isCUDABuiltInIndex(E);
+    }
+
+    void collectWrittenVars(Stmt* S, std::set<const VarDecl*>& Written) {
+      class WrittenVarCollector
+          : public RecursiveASTVisitor<WrittenVarCollector> {
+        std::set<const VarDecl*>* m_Written;
+
+        void mark(const Expr* E) {
+          if (const auto* DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts()))
+            if (const auto* VD = dyn_cast<VarDecl>(DRE->getDecl()))
+              m_Written->insert(VD);
+        }
+
+        /// Marks the arguments \p Callee may write. A parameter type is what
+        /// says so, and where there is none to consult -- an indirect call --
+        /// every argument counts as written.
+        void markByRefArgs(const FunctionDecl* Callee,
+                           llvm::ArrayRef<Expr*> Args) {
+          for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+            if (Callee) {
+              // Past the last parameter the argument is a variadic one, and
+              // `...` takes its arguments by value, so printf("%d", i) leaves
+              // i alone. Passing it for writing reads as printf("%d", &i),
+              // where the address is what the callee gets and taking it is
+              // already a write.
+              if (i >= Callee->getNumParams())
+                continue;
+              QualType T = Callee->getParamDecl(i)->getType();
+              if (!T->isLValueReferenceType() ||
+                  T.getNonReferenceType().isConstQualified())
+                continue;
+            }
+            mark(Args[i]);
+          }
+        }
+
+      public:
+        explicit WrittenVarCollector(std::set<const VarDecl*>& Written)
+            : m_Written(&Written) {}
+
+        bool VisitBinaryOperator(BinaryOperator* BO) {
+          if (BO->isAssignmentOp())
+            mark(BO->getLHS());
+          return true;
+        }
+
+        bool VisitUnaryOperator(UnaryOperator* UO) {
+          // A taken address is a write that can happen anywhere later.
+          if (UO->isIncrementDecrementOp() || UO->getOpcode() == UO_AddrOf)
+            mark(UO->getSubExpr());
+          return true;
+        }
+
+        bool VisitCallExpr(CallExpr* CE) {
+          const FunctionDecl* FD = CE->getDirectCallee();
+          // An overloaded operator passes its object as argument zero, so the
+          // arguments sit one ahead of the parameters when it is a member.
+          unsigned Offset = isa<CXXOperatorCallExpr>(CE) &&
+                            isa_and_nonnull<CXXMethodDecl>(FD);
+          llvm::ArrayRef<Expr*> Args(CE->getArgs(), CE->getNumArgs());
+          markByRefArgs(FD, Args.drop_front(Offset));
+          return true;
+        }
+
+        bool VisitCXXConstructExpr(CXXConstructExpr* CE) {
+          markByRefArgs(CE->getConstructor(),
+                        llvm::ArrayRef<Expr*>(CE->getArgs(), CE->getNumArgs()));
+          return true;
+        }
+      };
+      WrittenVarCollector Collector(Written);
+      Collector.TraverseStmt(S);
     }
   } // namespace utils
 } // namespace clad

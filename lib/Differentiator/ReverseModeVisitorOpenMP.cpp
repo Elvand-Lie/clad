@@ -1,4 +1,5 @@
 #include "ConstantFolder.h"
+#include "LoopScope.h"
 #include "clad/Differentiator/Compatibility.h"
 #include "clad/Differentiator/DerivativeBuilder.h"
 #include "clad/Differentiator/MultiplexExternalRMVSource.h"
@@ -13,12 +14,14 @@
 #include <clang/AST/Stmt.h>
 #include <clang/AST/StmtOpenMP.h>
 #include <clang/AST/Type.h>
+#include <clang/Basic/Diagnostic.h>
 #include <clang/Basic/LLVM.h>
 #include <clang/Basic/OpenMPKinds.h>
 #include <clang/Basic/OperatorKinds.h>
 #include <clang/Basic/Specifiers.h>
 #include <clang/Sema/DeclSpec.h>
 #include <clang/Sema/Scope.h>
+#include <llvm/ADT/STLExtras.h>
 #include <llvm/Frontend/OpenMP/OMP.h.inc>
 #include <llvm/Support/ErrorHandling.h>
 
@@ -180,9 +183,9 @@ StmtDiff ReverseModeVisitor::DifferentiateCanonicalLoop(const ForStmt* S) {
   if (!IsIncrement)
     Stride = BuildOp(UO_Minus, Stride);
 
-  llvm::SaveAndRestore<bool> SaveIsInsideLoop(isInsideLoop);
-  // Set isInsideLoop to true to enable tape generation
-  isInsideLoop = true;
+  // The statements below are the loop's own, so they are taped.
+  assert(m_CurrentLoop && "a canonical loop is differentiated in its region");
+  llvm::SaveAndRestore<bool> SaveTapes(m_CurrentLoop->Tapes, true);
 
   // Create variables for chunk bounds: threadlo, threadhi
   QualType IntTy = m_Context.IntTy;
@@ -399,6 +402,35 @@ OMPClause* ReverseModeVisitor::BuildOMPPrivateClause(ArrayRef<Expr*> VarList,
                                   PrivateCopies);
 }
 
+/// Wrap \p Update in `#pragma omp atomic`, so that threads adding to the same
+/// adjoint do not lose each other's work.
+static Stmt* buildAtomicUpdate(Sema& S, Expr* Update, SourceLocation StartLoc,
+                               SourceLocation EndLoc) {
+  DeclarationNameInfo DirName;
+  llvm::SmallVector<OMPClause*, 0> NoClauses;
+  return CLAD_COMPAT_CLANG19_SemaOpenMP(S)
+      .ActOnOpenMPExecutableDirective(OMPD_atomic, DirName, OMPD_unknown,
+                                      NoClauses, Update, StartLoc, EndLoc)
+      .get();
+}
+
+/// Build `reduction(+: Vars)`, which is how a clause gives its adjoint a copy
+/// per thread that starts at the identity and is summed back at the end.
+static OMPClause* buildSumReduction(Sema& S, ASTContext& Ctx,
+                                    ArrayRef<Expr*> Vars,
+                                    SourceLocation StartLoc,
+                                    SourceLocation LParenLoc,
+                                    SourceLocation EndLoc) {
+  CXXScopeSpec ReductionIdScopeSpec;
+  DeclarationName Plus =
+      Ctx.DeclarationNames.getCXXOperatorName(clang::OO_Plus);
+  DeclarationNameInfo ReductionId(Plus, StartLoc);
+  return CLAD_COMPAT_CLANG19_SemaOpenMP(S).ActOnOpenMPReductionClause(
+      Vars, CLAD_COMPAT_CLANG21_createModifier(OMPC_REDUCTION_unknown),
+      StartLoc, LParenLoc, noLoc, noLoc, EndLoc, ReductionIdScopeSpec,
+      ReductionId);
+}
+
 std::array<OMPClause*, 3>
 ReverseModeVisitor::VisitOMPPrivateClause(const OMPPrivateClause* C) {
   llvm::SmallVector<Expr*, 16> Vars;
@@ -409,12 +441,36 @@ ReverseModeVisitor::VisitOMPPrivateClause(const OMPPrivateClause* C) {
     DiffVars.push_back(Visit(Var).getExpr_dx());
     Vars.push_back(Clone(Var));
   }
+  // The primal's copy is private because each thread writes it before reading
+  // it; the adjoint is the other way round, since the reverse sweep only ever
+  // accumulates into it, and a private copy leaves every thread adding to
+  // whatever was on the stack. A reduction starts each copy at the identity,
+  // as the clauses below already arrange for theirs. Summing the copies back
+  // adds nothing as long as the region writes the variable before reading it,
+  // which is what private asks of it.
+  //
+  // A reduction needs a type '+' accepts. For anything else the adjoint stays
+  // private, uninitialised as before, and says so rather than letting the
+  // generated clause fail to compile inside the user's pragma.
+  bool Reducible = llvm::all_of(DiffVars, [](const Expr* E) {
+    return E && E->getType().getNonReferenceType()->isArithmeticType();
+  });
+  if (!Reducible)
+    diag(DiagnosticsEngine::Warning, C->getBeginLoc(),
+         "adjoints of private variables are accumulated per thread, which "
+         "needs a type '+' accepts; this one is left uninitialised")
+        << C->getBeginLoc();
+  OMPClause* AdjointClause =
+      Reducible
+          ? buildSumReduction(m_Sema, m_Context, DiffVars, C->getBeginLoc(),
+                              C->getLParenLoc(), C->getEndLoc())
+          : CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPPrivateClause(
+                DiffVars, C->getBeginLoc(), C->getLParenLoc(), C->getEndLoc());
   return {CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPPrivateClause(
               Vars, C->getBeginLoc(), C->getLParenLoc(), C->getEndLoc()),
           CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPPrivateClause(
               Vars, C->getBeginLoc(), C->getLParenLoc(), C->getEndLoc()),
-          CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPPrivateClause(
-              DiffVars, C->getBeginLoc(), C->getLParenLoc(), C->getEndLoc())};
+          AdjointClause};
 }
 
 std::array<OMPClause*, 3>
@@ -427,19 +483,12 @@ ReverseModeVisitor::VisitOMPFirstprivateClause(const OMPFirstprivateClause* C) {
     DiffVars.push_back(Visit(Var).getExpr_dx());
     Vars.push_back(Clone(Var));
   }
-  CXXScopeSpec ReductionIdScopeSpec;
-  DeclarationName ReductionOpName =
-      m_Context.DeclarationNames.getCXXOperatorName(clang::OO_Plus);
-  DeclarationNameInfo ReductonId(ReductionOpName, C->getBeginLoc());
   return {CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPFirstprivateClause(
               Vars, C->getBeginLoc(), C->getLParenLoc(), C->getEndLoc()),
           CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPFirstprivateClause(
               Vars, C->getBeginLoc(), C->getLParenLoc(), C->getEndLoc()),
-          CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPReductionClause(
-              DiffVars,
-              CLAD_COMPAT_CLANG21_createModifier(OMPC_REDUCTION_unknown),
-              C->getBeginLoc(), C->getLParenLoc(), noLoc, noLoc, C->getEndLoc(),
-              ReductionIdScopeSpec, ReductonId)};
+          buildSumReduction(m_Sema, m_Context, DiffVars, C->getBeginLoc(),
+                            C->getLParenLoc(), C->getEndLoc())};
 }
 
 std::array<OMPClause*, 3>
@@ -452,19 +501,12 @@ ReverseModeVisitor::VisitOMPSharedClause(const OMPSharedClause* C) {
     DiffVars.push_back(Visit(Var).getExpr_dx());
     Vars.push_back(Clone(Var));
   }
-  CXXScopeSpec ReductionIdScopeSpec;
-  DeclarationName ReductionOpName =
-      m_Context.DeclarationNames.getCXXOperatorName(clang::OO_Plus);
-  DeclarationNameInfo ReductonId(ReductionOpName, C->getBeginLoc());
   return {CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPSharedClause(
               Vars, C->getBeginLoc(), C->getLParenLoc(), C->getEndLoc()),
           CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPSharedClause(
               Vars, C->getBeginLoc(), C->getLParenLoc(), C->getEndLoc()),
-          CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPReductionClause(
-              DiffVars,
-              CLAD_COMPAT_CLANG21_createModifier(OMPC_REDUCTION_unknown),
-              C->getBeginLoc(), C->getLParenLoc(), noLoc, noLoc, C->getEndLoc(),
-              ReductionIdScopeSpec, ReductonId)};
+          buildSumReduction(m_Sema, m_Context, DiffVars, C->getBeginLoc(),
+                            C->getLParenLoc(), C->getEndLoc())};
 }
 
 std::array<OMPClause*, 3>
@@ -520,6 +562,10 @@ StmtDiff ReverseModeVisitor::VisitOMPExecutableDirective(
     // Set the flag to indicate we are inside an OpenMP block
     llvm::SaveAndRestore<bool> SaveisInsideOMPBlock(isInsideOMPBlock);
     isInsideOMPBlock = true;
+    // An enclosing loop keeps its accumulators outside this region, where
+    // every thread would share them, so none of them is visible in here.
+    LoopScope Region(*this);
+    Region.Sums = nullptr;
 
     CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPRegionStart(
         OMPD_parallel, getCurrentScope());
@@ -528,6 +574,13 @@ StmtDiff ReverseModeVisitor::VisitOMPExecutableDirective(
       Sema::CompoundScopeRAII CompoundScope(m_Sema);
       if (isOpenMPLoopDirective(D->getDirectiveKind())) {
         const auto* FS = cast<ForStmt>(CS);
+        Region.Facts = &m_DiffReq.getLoopFacts(FS);
+        // For the body alone. What is summed here is declared in the region
+        // the body belongs to, so a read reaching this scope afterwards --
+        // the reverse region is built from it -- would name a variable
+        // declared in a region it sits outside of.
+        llvm::SaveAndRestore<LoopScope*> SumHere(
+            Region.Sums, Region.Facts->IndVar ? &Region : nullptr);
         BodyDiff = DifferentiateCanonicalLoop(FS);
       } else {
         BodyDiff = Visit(CS);
@@ -563,6 +616,26 @@ StmtDiff ReverseModeVisitor::VisitOMPExecutableDirective(
       }
       m_Globals.swap(temp);
     }
+    // Every thread adds to such an adjoint at the same index. Each sums its
+    // share into an accumulator declared inside the region, so it has one of
+    // its own, and adds it once under `omp atomic`: one update per thread in
+    // place of one racing store per iteration.
+    if (!Region.Accumulators.empty()) {
+      Stmts Body;
+      for (const LoopScope::Accumulator& A : Region.Accumulators) {
+        // Made while the forward region was open, so that is its context. It
+        // belongs to the reverse region, which declares it.
+        A.Acc->setDeclContext(m_Sema.CurContext);
+        Body.push_back(BuildDeclStmt(A.Acc));
+      }
+      Body.push_back(BodyDiff.getStmt_dx());
+      for (const LoopScope::Accumulator& A : Region.Accumulators)
+        Body.push_back(buildAtomicUpdate(
+            m_Sema, BuildOp(BO_AddAssign, A.Target, BuildDeclRef(A.Acc)),
+            D->getBeginLoc(), D->getEndLoc()));
+      BodyDiff = {BodyDiff.getStmt(), MakeCompoundStmt(Body)};
+    }
+
     Stmt* Reverse =
         CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema)
             .ActOnOpenMPRegionEnd(BodyDiff.getStmt_dx(), DiffClauses)

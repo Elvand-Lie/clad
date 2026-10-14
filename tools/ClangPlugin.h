@@ -12,7 +12,9 @@
 #include "clad/Differentiator/DiffMode.h"
 #include "clad/Differentiator/DiffPlanner.h"
 #include "clad/Differentiator/DiffScheduler.h"
+#include "clad/Differentiator/Options.h"
 #include "clad/Differentiator/Version.h"
+#include "../lib/Differentiator/DerivativePrinter.h"
 
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
@@ -23,16 +25,14 @@
 #include "clang/Frontend/MultiplexConsumer.h"
 #include "clang/Sema/SemaConsumer.h"
 
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Casting.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <cassert>
 #include <deque>
-#include <map>
-#include <set>
 #include <string>
+#include <vector>
 
 namespace clang {
   class ASTContext;
@@ -47,62 +47,46 @@ namespace clang {
 namespace clad {
 
 bool checkClangVersion();
+
 namespace plugin {
-struct DifferentiationOptions {
-  // Plain bool, not `: 1` bit-fields: with 13 single-bit bools packed
-  // into shared bytes, the compiler emits each ctor-init-list write as
-  // a read-modify-write of the storage byte. The first RMW reads the
-  // byte while it is still uninitialised, which MSan reports as a SEGV
-  // on uninitialised memory under -fsanitize=memory.
-  bool DumpSourceFn = false;
-  bool DumpSourceFnAST = false;
-  bool DumpDerivedFn = false;
-  bool DumpDerivedAST = false;
-  bool GenerateSourceFile = false;
-  bool ValidateClangVersion = true;
-  bool EnableTBRAnalysis = false;
-  bool DisableTBRAnalysis = false;
-  bool EnableVariedAnalysis = false;
-  bool DisableVariedAnalysis = false;
-  bool EnableUsefulAnalysis = false;
-  bool DisableUsefulAnalysis = false;
-  bool PrintNumDiffErrorInfo = false;
-  bool EmitPortingHints = false;
+
+class CladExternalSource : public clang::ExternalSemaSource {
+  // ExternalSemaSource
+  void ReadUndefinedButUsed(
+      llvm::MapVector<clang::NamedDecl*, clang::SourceLocation>& Undefined)
+      override {
+    // namespace { double f_darg0(double x); } will issue a warning that
+    // f_darg0 has internal linkage but is not defined. This is because we
+    // have not yet started to differentiate it. The warning is triggered by
+    // Sema::ActOnEndOfTranslationUnit before Clad is given control.
+    // To avoid the warning we should remove the entry from here.
+    using namespace clang;
+    Undefined.remove_if([](std::pair<NamedDecl*, SourceLocation> P) {
+      NamedDecl* ND = P.first;
+
+      if (!ND->getDeclName().isIdentifier())
+        return false;
+
+      // FIXME: We should replace this comparison with the canonical decl
+      // from the differentiation plan...
+      llvm::StringRef Name = ND->getName();
+      return Name.contains("_darg") || Name.contains("_grad") ||
+             Name.contains("_hessian") || Name.contains("_jacobian");
+    });
+  }
 };
-
-    class CladExternalSource : public clang::ExternalSemaSource {
-    // ExternalSemaSource
-    void ReadUndefinedButUsed(
-        llvm::MapVector<clang::NamedDecl*, clang::SourceLocation>& Undefined)
-        override {
-      // namespace { double f_darg0(double x); } will issue a warning that
-      // f_darg0 has internal linkage but is not defined. This is because we
-      // have not yet started to differentiate it. The warning is triggered by
-      // Sema::ActOnEndOfTranslationUnit before Clad is given control.
-      // To avoid the warning we should remove the entry from here.
-      using namespace clang;
-      Undefined.remove_if([](std::pair<NamedDecl*, SourceLocation> P) {
-        NamedDecl* ND = P.first;
-
-        if (!ND->getDeclName().isIdentifier())
-          return false;
-
-        // FIXME: We should replace this comparison with the canonical decl
-        // from the differentiation plan...
-        llvm::StringRef Name = ND->getName();
-        return Name.contains("_darg") || Name.contains("_grad") ||
-               Name.contains("_hessian") || Name.contains("_jacobian");
-      });
-    }
-    };
+    /// \ingroup pipeline
     class CladPlugin : public clang::SemaConsumer {
     clang::CompilerInstance& m_CI;
-    DifferentiationOptions m_DO;
+    Options m_DO;
     std::unique_ptr<DerivativeBuilder> m_DerivativeBuilder;
     bool m_HasRuntime = false;
     /// Lazily constructed because it needs Sema, which is not available
     /// until InitializeSema; reach it through getScheduler().
     std::unique_ptr<DiffScheduler> m_Scheduler;
+    /// Built on first use; a run that reports nothing never renders anything.
+    /// Reach it through getDerivativePrinter().
+    std::unique_ptr<DerivativePrinter> m_DerivativePrinter;
     enum class CallKind {
       HandleCXXStaticMemberVarInstantiation,
       HandleTopLevelDecl,
@@ -156,8 +140,24 @@ struct DifferentiationOptions {
     /// The Sema::TUScope to restore in CladPlugin::HandleTranslationUnit.
     clang::Scope* m_StoredTUScope = nullptr;
 
+    /// A derivative, and what a report about it would say.
+    struct Generated {
+      clang::FunctionDecl* Derivative = nullptr;
+      /// What was differentiated to get it, and where that was written.
+      /// Both or neither: clad asks for some derivatives itself, and those
+      /// were written on no line at all.
+      const clang::FunctionDecl* Original = nullptr;
+      clang::SourceLocation RequestedAt;
+      /// Whether the to-be-recorded analysis ran, which decides the reason a
+      /// remark gives for a value being kept.
+      bool AnalysisRan = false;
+    };
+
+    /// The derivatives produced here, in the order they were produced.
+    llvm::SmallVector<Generated, 8> m_Generated;
+
   public:
-    CladPlugin(clang::CompilerInstance& CI, DifferentiationOptions& DO);
+    CladPlugin(clang::CompilerInstance& CI, Options& DO);
     ~CladPlugin() override;
     // ASTConsumer
     void Initialize(clang::ASTContext& Context) override;
@@ -257,6 +257,16 @@ struct DifferentiationOptions {
 
   private:
     DiffScheduler& getScheduler();
+    DerivativePrinter& getDerivativePrinter();
+    /// Says, once, that nothing will be able to show the generated code, and
+    /// what to add. Only when debug information was asked for and neither way
+    /// of reaching the code is in place.
+    void adviseOnGeneratedSource() const;
+
+    /// Prints every derivative into the buffer its nodes point into, then
+    /// reports on it: the line notes, the remarks, the source dump. Runs once
+    /// the whole unit is derived and before code generation.
+    void materializeGeneratedCode();
     void AppendDelayed(DelayedCallInfo DCI) {
       // Incremental processing handles the translation unit in chunks and it is
       // expected to have multiple calls to this functionality.
@@ -278,7 +288,12 @@ struct DifferentiationOptions {
     void FinalizeTranslationUnit();
     void SendToMultiplexer();
     bool CheckBuiltins();
-    void SetRequestOptions(RequestOptions& opts) const;
+    /// Shows what a generated function looks like as text, and where inside
+    /// that text each of its statements sits.
+    void dumpGeneratedSource(clang::Decl* D);
+    /// Reports what an analysis left behind, at the generated code it left it
+    /// in.
+    void emitAnalysisRemarks(const Generated& G);
 
     void ProcessTopLevelDecl(clang::Decl* D) {
       DelayedCallInfo DCI{CallKind::HandleTopLevelDecl, D};
@@ -300,7 +315,7 @@ struct DifferentiationOptions {
     template <typename ConsumerType>
     class Action : public clang::PluginASTAction {
     private:
-      DifferentiationOptions m_DO;
+      Options m_DO;
 
     protected:
       std::unique_ptr<clang::ASTConsumer>
@@ -311,102 +326,10 @@ struct DifferentiationOptions {
 
       bool ParseArgs(const clang::CompilerInstance& CI,
                      const std::vector<std::string>& args) override {
-        for (unsigned i = 0, e = args.size(); i != e; ++i) {
-          if (args[i] == "-fdump-source-fn") {
-            m_DO.DumpSourceFn = true;
-          } else if (args[i] == "-fdump-source-fn-ast") {
-            m_DO.DumpSourceFnAST = true;
-          } else if (args[i] == "-fdump-derived-fn") {
-            m_DO.DumpDerivedFn = true;
-          } else if (args[i] == "-fdump-derived-fn-ast") {
-            m_DO.DumpDerivedAST = true;
-          } else if (args[i] == "-fgenerate-source-file") {
-            m_DO.GenerateSourceFile = true;
-          } else if (args[i] == "-fno-validate-clang-version") {
-            m_DO.ValidateClangVersion = false;
-          } else if (args[i] == "-enable-tbr") {
-            m_DO.EnableTBRAnalysis = true;
-          } else if (args[i] == "-disable-tbr") {
-            m_DO.DisableTBRAnalysis = true;
-          } else if (args[i] == "-enable-va") {
-            m_DO.EnableVariedAnalysis = true;
-          } else if (args[i] == "-disable-va") {
-            m_DO.DisableVariedAnalysis = true;
-          } else if (args[i] == "-enable-ua") {
-            m_DO.EnableUsefulAnalysis = true;
-          } else if (args[i] == "-disable-ua") {
-            m_DO.DisableUsefulAnalysis = true;
-          } else if (args[i] == "-fcustom-estimation-model") {
-            llvm::errs() << "`-fcustom-estimation-model` is deprecated.";
-            ++i;
-            return false;
-          } else if (args[i] == "-fprint-num-diff-errors") {
-            m_DO.PrintNumDiffErrorInfo = true;
-          } else if (args[i] == "-fclad-porting-hints") {
-            m_DO.EmitPortingHints = true;
-          } else if (args[i] == "-help") {
-            // Print some help info.
-            // CI.getFrontendOpts().ShowHelp does not give us control.
-            llvm::errs()
-                << "Options specific to Clad (preceded by -plugin-arg-clad):"
-                << "-fdump-source-fn - Prints out the source code of the "
-                   "function.\n"
-                << "-fdump-source-fn-ast - Prints out the AST of the "
-                   "function.\n"
-                << "-fdump-derived-fn - Prints out the source code of the "
-                   "derivative.\n"
-                << "-fdump-derived-fn-ast - Prints out the AST of the "
-                   "derivative.\n"
-                << "-fgenerate-source-file - Produces a file containing the "
-                   "derivatives.\n"
-                << "-fno-validate-clang-version - Disables the validation of "
-                   "the clang version.\n"
-                << "-enable-tbr - Ensures that TBR analysis is enabled during "
-                   "reverse-mode differentiation unless explicitly specified "
-                   "in an individual request.\n"
-                << "-disable-tbr - Ensures that TBR analysis is disabled "
-                   "during reverse-mode differentiation unless explicitly "
-                   "specified in an individual request.\n"
-                << "-fcustom-estimation-model - allows user to send in a "
-                   "shared object to use as the custom estimation model.\n"
-                << "-fprint-num-diff-errors - allows users to print the "
-                   "calculated numerical diff errors, this flag is overriden "
-                   "by -DCLAD_NO_NUM_DIFF.\n"
-                << "-fclad-porting-hints - When clad has no custom derivative "
-                   "for a function defined outside the main source file and "
-                   "falls back to differentiating its definition, emit a "
-                   "remark naming the expected custom-derivative signature and "
-                   "the non-differentiable marker. Useful when teaching clad "
-                   "about a new library.\n";
-
-            llvm::errs() << "-help - Prints out this screen.\n\n";
-          } else if (args[i] == "-version" || args[i] == "-v") {
-            // CI.getFrontendOpts().ShowHelp does not give us control.
-            llvm::errs() << getCladFullVersion() << "\n";
-          } else {
-            llvm::errs() << "clad: Error: invalid option " << args[i] << "\n";
-            return false; // Tells clang not to create the plugin.
-          }
-        }
-        if (m_DO.ValidateClangVersion != false) {
-          if (!checkClangVersion())
-            return false;
-        }
-        if (m_DO.EnableTBRAnalysis && m_DO.DisableTBRAnalysis) {
-          llvm::errs() << "clad: Error: -enable-tbr and -disable-tbr cannot "
-                          "be used together.\n";
+        if (!m_DO.read(args))
           return false;
-        }
-        if (m_DO.EnableVariedAnalysis && m_DO.DisableVariedAnalysis) {
-          llvm::errs() << "clad: Error: -enable-va and -disable-va cannot "
-                          "be used together.\n";
+        if (m_DO.ValidateClangVersion && !checkClangVersion())
           return false;
-        }
-        if (m_DO.EnableUsefulAnalysis && m_DO.DisableUsefulAnalysis) {
-          llvm::errs() << "clad: Error: -enable-ua and -disable-ua cannot "
-                          "be used together.\n";
-          return false;
-        }
         return true;
       }
 
@@ -414,7 +337,7 @@ struct DifferentiationOptions {
         return AddAfterMainAction;
       }
     };
-  } // end namespace plugin
+    } // end namespace plugin
 } // end namespace clad
 
 #endif // CLAD_CLANG_PLUGIN

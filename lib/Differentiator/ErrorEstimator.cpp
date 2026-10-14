@@ -423,7 +423,7 @@ void ErrorEstimationHandler::ActBeforeFinalizingVisitReturnStmt(
 }
 
 void ErrorEstimationHandler::ActBeforeFinalizingPostIncDecOp(StmtDiff& diff) {
-  EmitUnaryOpErrorStmts(diff, m_RMV->isInsideLoop);
+  EmitUnaryOpErrorStmts(diff, m_RMV->isInsideLoop());
 }
 
 // FIXME: Issue a warning that error estimation may produce incorrect result if
@@ -503,8 +503,7 @@ void ErrorEstimationHandler::LookupCustomErrorFunction() {
     // namespace specifier. Here, we rebuild manually.
     CXXScopeSpec SS;
     SS.Extend(C, cladNS, noLoc, noLoc);
-    m_CustomErrorFunction =
-        S.BuildDeclarationNameExpr(SS, R, /*ADL=*/false).get();
+    m_CustomErrorFunction = utils::BuildDeclarationNameExpr(S, SS, R);
     return;
   }
 
@@ -562,7 +561,7 @@ void ErrorEstimationHandler::ActBeforeFinalizingVisitDeclStmt(
   for (size_t i = 0; i < decls.size(); i++) {
     DeclDiff<VarDecl> VDDiff(cast<VarDecl>(decls[0]),
                              cast<VarDecl>(declsDiff[0]));
-    EmitDeclErrorStmts(VDDiff, m_RMV->isInsideLoop);
+    EmitDeclErrorStmts(VDDiff, m_RMV->isInsideLoop());
   }
 }
 } // namespace clad
