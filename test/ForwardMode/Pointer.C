@@ -8,9 +8,12 @@
 double fn1(double i, double j) {
   double *p = &i;
   double **q = new double *;
-  *q = new double;
+  *q = new (std::nothrow) double;
   **q = j;
-  return *p * **q;
+  double res = *p * **q;
+  delete *q;
+  delete q;
+  return res;
 }
 
 // CHECK: double fn1_darg0(double i, double j) {
@@ -20,11 +23,17 @@ double fn1(double i, double j) {
 // CHECK-NEXT:     double *p = &i;
 // CHECK-NEXT:     double **_d_q = new double *;
 // CHECK-NEXT:     double **q = new double *;
-// CHECK-NEXT:     *_d_q = new double;
-// CHECK-NEXT:     *q = new double;
+// CHECK-NEXT:     *_d_q = new (std::nothrow) double;
+// CHECK-NEXT:     *q = new (std::nothrow) double;
 // CHECK-NEXT:     **_d_q = _d_j;
 // CHECK-NEXT:     **q = j;
-// CHECK-NEXT:     return *_d_p * **q + *p * **_d_q;
+// CHECK-NEXT:     double _d_res = *_d_p * **q + *p * **_d_q;
+// CHECK-NEXT:     double res = *p * **q;
+// CHECK-NEXT:     delete *_d_q;
+// CHECK-NEXT:     delete *q;
+// CHECK-NEXT:     delete _d_q;
+// CHECK-NEXT:     delete q;
+// CHECK-NEXT:     return _d_res;
 // CHECK-NEXT: }
 
 double fn2(double i, double j) {
@@ -41,7 +50,9 @@ double fn3(double i, double j) {
   double *p = new double[2];
   p[0] = i + j;
   p[1] = i*j;
-  return p[0] + p[1];
+  double res = p[0] + p[1];
+  delete[] p;
+  return res;
 }
 
 // CHECK: double fn3_darg0(double i, double j) {
@@ -53,7 +64,11 @@ double fn3(double i, double j) {
 // CHECK-NEXT:     p[0] = i + j;
 // CHECK-NEXT:     _d_p[1] = _d_i * j + i * _d_j;
 // CHECK-NEXT:     p[1] = i * j;
-// CHECK-NEXT:     return _d_p[0] + _d_p[1];
+// CHECK-NEXT:     double _d_res = _d_p[0] + _d_p[1];
+// CHECK-NEXT:     double res = p[0] + p[1];
+// CHECK-NEXT:     delete [] _d_p;
+// CHECK-NEXT:     delete [] p;
+// CHECK-NEXT:     return _d_res;
 // CHECK-NEXT: }
 
 double fn4(double i, double j) {
@@ -153,14 +168,14 @@ double fn7(double i) {
 // CHECK-NEXT:     double *p = (double *)_t0.value;
 // CHECK-NEXT:     *_d_p = _d_i;
 // CHECK-NEXT:     *p = i;
-// CHECK-NEXT:     {{(clad::)?}}ValueAndPushforward<void *, void *> _t1 = clad::custom_derivatives::calloc_pushforward(1, sizeof(T), 0, sizeof(T));
+// CHECK-NEXT:     {{(clad::)?}}ValueAndPushforward<void *, void *> _t1 = clad::custom_derivatives::calloc_pushforward(1, sizeof(T), 0, 0U{{L?}});
 // CHECK-NEXT:     T *_d_t = (T *)_t1.pushforward;
 // CHECK-NEXT:     T *t = (T *)_t1.value;
 // CHECK-NEXT:     _d_t->i = _d_i;
 // CHECK-NEXT:     t->i = i;
 // CHECK-NEXT:     double _d_res = *_d_p + _d_t->i;
 // CHECK-NEXT:     double res = *p + t->i;
-// CHECK-NEXT:     {{(clad::)?}}ValueAndPushforward<void *, void *> _t2 = clad::custom_derivatives::realloc_pushforward(p, 2 * sizeof(double), _d_p, 2 * sizeof(double));
+// CHECK-NEXT:     {{(clad::)?}}ValueAndPushforward<void *, void *> _t2 = clad::custom_derivatives::realloc_pushforward(p, 2 * sizeof(double), _d_p, 0U{{L?}});
 // CHECK-NEXT:     _d_p = (double *)_t2.pushforward;
 // CHECK-NEXT:     p = (double *)_t2.value;
 // CHECK-NEXT:     _d_p[1] = 2 * _d_i;
@@ -214,6 +229,45 @@ double fn10(double *params, const double *constants) {
 // CHECK-NEXT:     return c0 + params[0] * _d_c0;
 // CHECK-NEXT: }
 
+double fn11(double x) {
+  double buf[1] = {x};
+  new (buf) double(buf[0] * x);
+  return buf[0] * x;
+}
+
+// CHECK: double fn11_darg0(double x) {
+// CHECK-NEXT:     double _d_x = 1;
+// CHECK-NEXT:     double _d_buf[1] = {_d_x};
+// CHECK-NEXT:     double buf[1] = {x};
+// CHECK-NEXT:     new (_d_buf) double(_d_buf[0] * x + buf[0] * _d_x);
+// CHECK-NEXT:     new (buf) double(buf[0] * x);
+// CHECK-NEXT:     return _d_buf[0] * x + buf[0] * _d_x;
+// CHECK-NEXT: }
+
+// A class's own placement new: the derivative goes to the derivative's
+// storage, not over the object, and the other arguments go to both.
+struct Cell {
+  double v;
+  static void* operator new(std::size_t, void* p, int) { return p; }
+};
+
+double fn12(double x) {
+  Cell c{x};
+  new (&c, 0) Cell{c.v * x};
+  return c.v * x;
+}
+
+// CHECK: double fn12_darg0(double x) {
+// CHECK-NEXT:     double _d_x = 1;
+// CHECK-NEXT:     Cell _d_c{_d_x};
+// CHECK-NEXT:     Cell c{x};
+// CHECK-NEXT:     double &_t0 = c.v;
+// CHECK-NEXT:     new (&_d_c, 0) Cell({_d_c.v * x + _t0 * _d_x});
+// CHECK-NEXT:     new (&c, 0) Cell({_t0 * x});
+// CHECK-NEXT:     double &_t1 = c.v;
+// CHECK-NEXT:     return _d_c.v * x + _t1 * _d_x;
+// CHECK-NEXT: }
+
 int main() {
   INIT_DIFFERENTIATE(fn1, "i");
   INIT_DIFFERENTIATE(fn2, "i");
@@ -244,4 +298,10 @@ int main() {
   auto fn10_dx = clad::differentiate(fn10, "params[0]");
   d_param = fn10_dx.execute(params, constants);
   printf("{%.2f}\n", d_param); // CHECK-EXEC: {5.00}
+
+  INIT_DIFFERENTIATE(fn11, "x");
+  TEST_DIFFERENTIATE(fn11, 3); // CHECK-EXEC: {27.00}
+
+  INIT_DIFFERENTIATE(fn12, "x");
+  TEST_DIFFERENTIATE(fn12, 3); // CHECK-EXEC: {27.00}
 }

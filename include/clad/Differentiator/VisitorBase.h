@@ -29,13 +29,15 @@
 #include "clang/Sema/Sema.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/PrettyStackTrace.h"
 
 // For the LambdaBuilder
 #if CLANG_VERSION_MAJOR > 16
-#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/SaveAndRestore.h"
 #endif // CLANG_VERSION_MAJOR > 16
 
@@ -50,6 +52,7 @@
 
 namespace clang {
 class NestedNameSpecifier;
+class LambdaExpr;
 } // namespace clang
 
 namespace llvm {
@@ -222,6 +225,7 @@ namespace clad {
   };
 
   /// A base class for all common functionality for visitors
+  /// \ingroup visitors
   class VisitorBase {
   protected:
     VisitorBase(DerivativeBuilder& builder, const DiffRequest& request)
@@ -266,6 +270,11 @@ namespace clad {
     /// See the example inside ForwardModeVisitor::VisitDeclStmt.
     std::unordered_map<const clang::VarDecl*, clang::VarDecl*>
         m_DeclReplacements;
+    /// The snapshot of a by-copy capture taken where its lambda is created,
+    /// keyed by the capture's field in the closure type, which names both the
+    /// lambda and the variable: one variable captured by two lambdas has two.
+    llvm::DenseMap<const clang::FieldDecl*, clang::VarDecl*>
+        m_LambdaCaptureSnapshots;
     /// A stack of all the blocks where the statements of the gradient function
     /// are stored (e.g., function body, if statement blocks).
     std::vector<Stmts> m_Blocks;
@@ -296,21 +305,21 @@ namespace clad {
     public:
       explicit LambdaCaptures(VisitorBase& V) : m_V(V) {}
       void collect(llvm::ArrayRef<clang::Stmt*> Body);
-      /// A `[&]` capture binds a variable at the lambda's definition point, so
-      /// every captured decl must precede the lambda. \p Prefix and \p Suffix
-      /// are the forward block split at the lambda's insertion point. Each
-      /// captured decl in \p Suffix moves to the end of \p Prefix: whole, if
-      /// its initializer references only names already live there (the
-      /// function's parameters, \p AlreadyLive, and \p Prefix); otherwise
-      /// split into a zero-initialized declaration (moved) plus an assignment
-      /// left at the original spot, so the real value is still computed where
-      /// the original control flow put it. Array decls, which have no
-      /// whole-object assignment to split into, stay in \p Suffix.
+      /// \p Prefix and \p Suffix are the forward sweep split where the
+      /// closure begins. A captured decl in \p Suffix is read after the
+      /// closure too, so it moves to the end of \p Prefix: whole, if
+      /// its initializer reads no local and no parameter; otherwise split into
+      /// a zero-initialized declaration (moved) plus an assignment left at the
+      /// original spot, so the value is computed where the original control
+      /// flow put it. Array decls, which have no whole-object assignment to
+      /// split into, stay in \p Suffix.
       void orderCaptureDecls(llvm::SmallVectorImpl<clang::Stmt*>& Prefix,
-                             llvm::SmallVectorImpl<clang::Stmt*>& Suffix,
-                             llvm::ArrayRef<clang::Stmt*> AlreadyLive);
+                             llvm::SmallVectorImpl<clang::Stmt*>& Suffix);
       void resolve(llvm::ArrayRef<clang::Stmt*> Body);
       bool contains(clang::VarDecl* VD) const { return m_Captures.count(VD); }
+      /// Adds \p VD as if the body had named it, so orderCaptureDecls moves
+      /// it too.
+      void add(clang::VarDecl* VD) { m_Captures.insert(VD); }
     };
 
 #if CLANG_VERSION_MAJOR > 16
@@ -353,7 +362,8 @@ namespace clad {
       /// into it. \p LE only supplies the declaration context to graft the
       /// closure onto, \p BuildParams appends the call operator's parameters.
       void start(const clang::LambdaExpr* LE, clang::QualType CallOpType,
-                 ParamBuilder BuildParams);
+                 ParamBuilder BuildParams,
+                 clang::QualType TrailingReturnType = {});
       /// Closes the scopes start() opened.
       clang::Expr* finish(clang::Stmt* Body);
     };
@@ -433,37 +443,18 @@ namespace clad {
           .get();
     }
 
-    /// Build a [&]-capture lambda whose body is produced by `func` and bind
-    /// it to a fresh VarDecl. Returns the VarDecl so the caller can wrap it
-    /// in a DeclStmt (placed at function-body scope) and call it from one or
-    /// more sites via DeclRefExpr + ActOnCallExpr. Use this when the same
-    /// lambda body must be invoked from multiple paths (e.g. a reverse-pass
-    /// segment shared between an early-return path and the natural tail).
-    ///
-    /// The binding uses `auto` deduction so the pretty-printer renders it as
-    /// `auto X = [&] {...};` rather than the closure type's unspellable
-    /// `(lambda at ...)` form. Sema deduces the concrete closure type from
-    /// the initializer; the TypeSourceInfo retains the `auto` keyword.
-    ///
-    /// \p func emits the closure body; \p Captures then resolves that body's
-    /// references to enclosing variables (its collect() must have already run),
-    /// so callers hand over a pure body-emission callback.
-    template <typename F>
-    clang::VarDecl* buildAndBindLambda(const clang::Stmt* LocSrc,
-                                       llvm::StringRef NameHint,
-                                       LambdaCaptures& Captures, F&& func) {
-      clang::Expr* lambda = buildLambda(*this, m_Sema, LocSrc, [&] {
-        std::forward<F>(func)();
-        // Resolve captures while the closure scope is active and its body is
-        // the current block.
-        Captures.resolve(getCurrentBlock());
-      });
-      clang::IdentifierInfo* II = CreateUniqueIdentifier(NameHint);
-      clang::QualType AutoTy = m_Context.getAutoDeductType();
-      clang::TypeSourceInfo* TSI = m_Context.getTrivialTypeSourceInfo(AutoTy);
-      return BuildVarDecl(AutoTy, II, lambda, /*DirectInit=*/false, TSI);
-    }
-
+    /// Resolve a captured variable to its clone in the enclosing derivative.
+    clang::VarDecl* getEnclosingCaptureClone(const clang::VarDecl* capVD);
+    /// The field of \p LE's closure type that holds the capture of \p capVD.
+    static const clang::FieldDecl* getCaptureField(const clang::LambdaExpr* LE,
+                                                   const clang::VarDecl* capVD);
+    /// The derivative closure of the lambda \p VD holds, which the
+    /// derivative tracks as the adjoint or tangent of \p VD's clone; null
+    /// where none was built.
+    clang::Expr* getLambdaDerivative(const clang::VarDecl* VD);
+    std::pair<clang::Expr*, clang::Expr*>
+    getCaptureValueAndAdjoint(const clang::LambdaExpr* LE,
+                              const clang::VarDecl* capVD, bool isByCopy);
     /// For a qualtype QT returns if it's type is Array or Pointer Type
     static bool isArrayOrPointerType(const clang::QualType QT) {
       return utils::isArrayOrPointerType(QT);
@@ -538,10 +529,14 @@ namespace clad {
     /// \endcode
     /// \param[in] OpCode The code for the unary operation to be built.
     /// \param[in] E The expression to build the unary operation with.
+    /// \param[in] OpLoc The location to give the operator.
     /// \returns An expression of the newly built unary operation or null if the
     /// operand in null.
     clang::Expr* BuildOp(clang::UnaryOperatorKind OpCode, clang::Expr* E,
                          clang::SourceLocation OpLoc = noLoc);
+    /// Rebuilds `&E`. Clang's implicit move assignment takes the address of an
+    /// xvalue, which Sema refuses to build, so that one is created directly.
+    clang::Expr* RebuildAddrOf(clang::Expr* E);
     /// A shorthand to simplify syntax for creation of new expressions.
     /// This function uses m_Sema.BuildBin internally to build binary
     /// operations. A typical usage of this function looks like the following:
@@ -557,6 +552,7 @@ namespace clad {
     /// \param[in] OpCode The code for the binary operation to be built.
     /// \param[in] L The LHS expression to build the binary operation with.
     /// \param[in] R The RHS expression to build the binary operation with.
+    /// \param[in] OpLoc The location to give the operator.
     /// \returns An expression of the newly built binary operation or null if
     /// either LHS or RHS is null.
     clang::Expr* BuildOp(clang::BinaryOperatorKind OpCode, clang::Expr* L,
@@ -600,11 +596,13 @@ namespace clad {
     /// \param[in] Type The type of variable declaration to build.
     /// \param[in] Identifier The identifier information for the variable
     /// declaration.
+    /// \param[in] scope The scope to declare the variable in.
     /// \param[in] Init The initalization expression to assign to the variable
     ///  declaration.
     /// \param[in] DirectInit A check for if the initialization expression is a
     /// C style initalization.
     /// \param[in] TSI The type source information of the variable declaration.
+    /// \param[in] SC The storage class of the variable declaration.
     /// \returns The newly built variable declaration.
     clang::VarDecl*
     BuildVarDecl(clang::QualType Type, clang::IdentifierInfo* Identifier,
@@ -621,6 +619,7 @@ namespace clad {
     /// \param[in] DirectInit A check for if the initialization expression is a
     /// C style initalization.
     /// \param[in] TSI The type source information of the variable declaration.
+    /// \param[in] SC The storage class of the variable declaration.
     /// \returns The newly built variable declaration.
     clang::VarDecl* BuildVarDecl(clang::QualType Type,
                                  clang::IdentifierInfo* Identifier,
@@ -637,6 +636,7 @@ namespace clad {
     /// \param[in] DirectInit A check for if the initialization expression is a
     /// C style initalization.
     /// \param[in] TSI The type source information of the variable declaration.
+    /// \param[in] SC The storage class of the variable declaration.
     /// \returns The newly built variable declaration.
     clang::VarDecl* BuildVarDecl(clang::QualType Type,
                                  llvm::StringRef prefix = "_t",
@@ -657,6 +657,25 @@ namespace clad {
     /// m_Sema.PopDeclContextIsUsed.
     clang::NamespaceDecl* BuildNamespaceDecl(clang::IdentifierInfo* II,
                                              bool isInline);
+    /// Re-declares a using-directive or using-declaration of the primal in
+    /// the derivative.
+    clang::Decl* BuildUsing(const clang::Decl* D);
+    /// Re-declares \p TND in the derivative and makes it findable there by
+    /// name, so the statements that follow can go on naming the type as they
+    /// did.
+    clang::TypedefNameDecl*
+    BuildTypedefNameDecl(const clang::TypedefNameDecl* TND);
+    /// The name a variable's clone takes: its own, or, for the unnamed
+    /// variable a structured binding decomposes, one to refer to it by.
+    static std::string CloneName(const clang::VarDecl* VD);
+    /// Diagnoses a structured binding clad does not differentiate yet, and
+    /// then returns false.
+    bool CheckStructuredBinding(const clang::DecompositionDecl* DD);
+    /// A statement declaring each variable a structured binding of a
+    /// tuple-like type introduces for its bindings.
+    llvm::SmallVector<clang::DeclStmt*, 4>
+    BuildHoldingVarStmts(const clang::DecompositionDecl* DD);
+
     /// Wraps a declaration in DeclStmt.
     /// \n Variable declaration cannot be added to code directly, instead we
     /// have to build a declaration staement.
@@ -667,7 +686,7 @@ namespace clad {
     /// Wraps a set of declarations in a DeclStmt.
     /// \n This function is useful to wrap multiple variable declarations in one
     /// single declaration statement.
-    /// \param[in] D The declarations to build a declaration statement from.
+    /// \param[in] DS The declarations to build a declaration statement from.
     /// \returns The declaration statement expression corresponding to the input
     /// variable declaration.
     clang::DeclStmt* BuildDeclStmt(llvm::MutableArrayRef<clang::Decl*> DS);
@@ -677,7 +696,8 @@ namespace clad {
     /// declaration reference expressions. This function builds a declaration
     /// reference given a declaration.
     /// \param[in] D The declaration to build a DeclRefExpr for.
-    /// \param[in] SS The nested name specifier for the declaration.
+    /// \param[in] NNS The nested name specifier to qualify the reference with.
+    /// \param[in] VK The value kind of the reference.
     /// \returns the DeclRefExpr for the given declaration.
     clang::DeclRefExpr* BuildDeclRef(
         clang::DeclaratorDecl* D,
@@ -731,6 +751,8 @@ namespace clad {
           << L;
     }
 
+    bool diagnoseUnsupportedLambda(const clang::LambdaExpr* LE);
+
     /// Shorthand for warning on differentiation of unsupported operators
     void unsupportedOpWarn(clang::SourceLocation loc) {
       diag(clang::DiagnosticsEngine::Warning, loc,
@@ -768,32 +790,34 @@ namespace clad {
     std::pair<const clang::Expr*, llvm::SmallVector<const clang::Expr*, 4>>
     SplitArraySubscript(const clang::Expr* ASE);
 
-    /// Build an array subscript expression with a given base expression and
-    /// a sequence of indices.
-    clang::Expr*
-    BuildArraySubscript(clang::Expr* Base,
-                        const llvm::SmallVectorImpl<clang::Expr*>& IS);
+    /// Build `Base[I0][I1]...` through Sema's subscript action, so a class's
+    /// operator[] is used as well as builtin subscripting. The brackets are
+    /// not ones the user wrote unless their locations are given, and a
+    /// subscript may instantiate operator[]'s return type, which needs a valid
+    /// location: so they default to GenLoc(). Null if a subscript is
+    /// ill-formed.
+    clang::Expr* BuildArraySubscript(
+        clang::Expr* Base, const llvm::SmallVectorImpl<clang::Expr*>& IS,
+        clang::SourceLocation LLoc = {}, clang::SourceLocation RLoc = {});
 
-    /// Build an array subscript expression with a given base expression and
-    /// one index.
-    clang::Expr* BuildArraySubscript(clang::Expr* Base, clang::Expr*& Idx) {
+    /// Build `Base[Idx]`, likewise.
+    clang::Expr* BuildArraySubscript(clang::Expr* Base, clang::Expr* Idx,
+                                     clang::SourceLocation LLoc = {},
+                                     clang::SourceLocation RLoc = {}) {
       llvm::SmallVector<clang::Expr*, 1> IS = {Idx};
-      return BuildArraySubscript(Base, IS);
+      return BuildArraySubscript(Base, IS, LLoc, RLoc);
     }
     /// Find declaration of clad::tape templated type.
     clang::TemplateDecl* GetCladTapeDecl();
-    /// Look up an entity with the given name in the clad namespace. The result
-    /// may be empty.
-    clang::LookupResult tryLookupCladMethod(llvm::StringRef name);
     /// Look up a required clad function template with the given name.
     clang::LookupResult LookupCladTapeMethod(llvm::StringRef name);
     /// Perform lookup into clad namespace for push/pop/back. Returns
     /// LookupResult, which is will be resolved later (which is handy since they
     /// are templates).
-    clang::LookupResult& GetCladTapePush();
-    clang::LookupResult& GetCladTapePop();
-    clang::LookupResult& GetCladTapeBack();
-    /// Instantiate clad::tape<T> type.
+    clang::LookupResult GetCladTapePush();
+    clang::LookupResult GetCladTapePop();
+    clang::LookupResult GetCladTapeBack();
+    /// Instantiate clad::tape\<T\> type.
     clang::QualType GetCladTapeOfType(clang::QualType T);
 
     /// Helper to build a function call expression.
@@ -811,7 +835,21 @@ namespace clad {
                                  const std::string& nmspace,
                                  llvm::SmallVectorImpl<clang::Expr*>& callArgs);
 
-    clang::DeclRefExpr* GetCladTapePushDRE();
+    /// Builds a call to \p Callee, giving its parentheses locations of their
+    /// own.
+    ///
+    /// A generated call has no parentheses anyone wrote, so the caller of
+    /// Sema::ActOnCallExpr has to say where they are. Deciding that here
+    /// rather than at each site is what makes one generated call tell apart
+    /// from another. Returns null if Sema rejects the call.
+    clang::Expr* BuildCallExpr(clang::Expr* Callee,
+                               llvm::MutableArrayRef<clang::Expr*> Args);
+
+    /// Builds a braced initializer over \p Elements, giving its braces
+    /// locations of their own. Same reason as BuildCallExpr.
+    clang::Expr* BuildInitList(llvm::MutableArrayRef<clang::Expr*> Elements);
+
+    clang::Expr* GetCladTapePushDRE();
 
     clang::Stmt* GetCladZeroInit(llvm::MutableArrayRef<clang::Expr*> args);
 
@@ -819,6 +857,18 @@ namespace clad {
     /// Returns null when the customization point is not implemented for the
     /// value's type.
     clang::Expr* GetCladZeroLike(clang::Expr* value);
+
+    /// Build a default zero adjoint of type T. Prefer zero_like for records
+    /// with a matching primal type; otherwise preserve type-based zero init.
+    /// StoreValue, if provided, stores side-effecting values used by zero_like
+    /// and returns an accessible lvalue. It preserves glvalues' cv-qualifiers
+    /// and removes top-level const when storing prvalues. Without it, a
+    /// side-effecting Value gets the type-based zero instead.
+    /// The returned expression owns a clone of Value.
+    /// Scalar zeros remain literals so constant folding can recognize them.
+    clang::Expr* BuildZeroAdjoint(
+        clang::Expr* Value, clang::QualType T,
+        llvm::function_ref<clang::Expr*(clang::Expr*)> StoreValue = nullptr);
 
     /// Assigns the Init expression to VD after performing the necessary
     /// implicit conversion. This is required as clang doesn't add implicit
@@ -839,11 +889,10 @@ namespace clad {
     ///
     /// \param[in] Base expr to the object which is used to call the member
     ///  function
-    /// \param[in] isArrow if true specifies that the member function is
-    /// accessed by an -> otherwise .
     /// \param[in] MemberFunctionName the name of the member function
     /// \param[in] ArgExprs the arguments to be used when calling the member
     ///  function
+    /// \param[in] Loc the location to give the call.
     /// \returns Built member function call expression
     ///  Base.MemberFunction(ArgExprs) or Base->MemberFunction(ArgExprs)
     clang::Expr*
@@ -865,6 +914,7 @@ namespace clad {
     /// \param[in] argExprs function arguments expressions
     /// \param[in] useRefQualifiedThisObj If true, then the `this` object is
     /// perfectly forwarded while calling member functions.
+    /// \param[in] Loc the location to give the call.
     /// \returns Built member function call expression
     clang::Expr* BuildCallExprToMemFn(
         clang::CXXMethodDecl* FD, llvm::MutableArrayRef<clang::Expr*> argExprs,
@@ -878,6 +928,8 @@ namespace clad {
     /// \param[in] argExprs function arguments expressions
     /// \param[in] useRefQualifiedThisObj If true, then the `this` object is
     /// perfectly forwarded while calling member functions.
+    /// \param[in] CUDAExecConfig the kernel launch configuration, for a call
+    /// to a __global__ function.
     /// \returns Built call expression
     clang::Expr*
     BuildCallExprToFunction(const clang::FunctionDecl* FD,
@@ -885,32 +937,56 @@ namespace clad {
                             clang::Expr* CUDAExecConfig = nullptr,
                             bool useRefQualifiedThisObj = false);
 
+    /// A location for a node about to be built, distinct from every other one
+    /// handed out.
+    clang::SourceLocation GenLoc();
+
+    /// Build a return statement. The `return` keyword is not one the user
+    /// wrote, so the location comes from here rather than from the caller.
+    clang::Stmt* BuildReturnStmt(clang::Expr* E);
+
+    /// Build `T(E)`. The parentheses are not ones the user wrote, so their
+    /// locations come from here rather than from the caller.
+    clang::Expr* BuildFunctionalCast(clang::TypeSourceInfo* TSI,
+                                     clang::QualType T, clang::Expr* E);
+
+    /// Build `(T)E`, likewise.
+    clang::Expr* BuildCStyleCast(clang::TypeSourceInfo* TSI, clang::Expr* E);
+
     /// Build a call to templated free function inside the clad namespace.
     ///
     /// \param[in] name name of the function
     /// \param[in] argExprs function arguments expressions
     /// \param[in] templateArgs template arguments
-    /// \param[in] loc location of the call
     /// \returns Built call expression
     clang::Expr* BuildCallExprToCladFunction(
         llvm::StringRef name, llvm::MutableArrayRef<clang::Expr*> argExprs,
-        llvm::ArrayRef<clang::TemplateArgument> templateArgs,
-        clang::SourceLocation loc);
+        llvm::ArrayRef<clang::TemplateArgument> templateArgs);
 
-    /// Checks if the type is of clad::array<T> or clad::array_ref<T> type
+    /// Builds the placement arguments of the derivative of \p CNE from its
+    /// differentiated placement arguments \p argDiffs. The derivative of
+    /// `new (p, ...) T(...)` is placed in the derivative of the storage it
+    /// reuses, `new (_d_p, ...) T(...)`; placement arguments that are not
+    /// storage, such as std::nothrow, are passed unchanged. Returns no
+    /// arguments, so that the derivative is allocated instead, when the
+    /// storage has no derivative to hold it.
+    llvm::SmallVector<clang::Expr*, 1>
+    BuildDerivedPlacementArgs(const clang::CXXNewExpr* CNE,
+                              llvm::MutableArrayRef<StmtDiff> argDiffs);
+
+    /// Checks if the type is of clad::array\<T\> or clad::array_ref\<T\> type
     bool isCladArrayType(clang::QualType QT);
 
-    /// Creates the expression clad::matrix<T>::identity(Args) for the given
+    /// Creates the expression %clad::matrix\<T\>::%identity(Args) for the given
     /// type and args.
     clang::Expr*
     BuildIdentityMatrixExpr(clang::QualType T,
-                            llvm::MutableArrayRef<clang::Expr*> Args,
-                            clang::SourceLocation Loc);
+                            llvm::MutableArrayRef<clang::Expr*> Args);
     /// Creates the expression Base.size() for the given Base expr. The Base
-    /// expr must be of clad::array_ref<T> type
+    /// expr must be of clad::array_ref\<T\> type
     clang::Expr* BuildArrayRefSizeExpr(clang::Expr* Base);
     /// Creates the expression Base.slice(Args) for the given Base expr and Args
-    /// array. The Base expr must be of clad::array_ref<T> type
+    /// array. The Base expr must be of clad::array_ref\<T\> type
     clang::Expr*
     BuildArrayRefSliceExpr(clang::Expr* Base,
                            llvm::MutableArrayRef<clang::Expr*> Args);
@@ -926,6 +1002,29 @@ namespace clad {
     /// captureless lambdas get a fresh closure; captured lambdas fall back to
     /// a plain clone. Inner lambda-init declarations are rebuilt recursively.
     clang::Expr* buildClonedLambda(const clang::LambdaExpr* LE);
+    /// Builds a call to the numerical_diff function \p Name, whose first
+    /// argument is the function to differentiate. That function's type is
+    /// also written as the first template argument: it was deduced from a
+    /// reference to one overload or specialization, and the name alone does
+    /// not say which.
+    clang::Expr*
+    BuildNumericalDiffCall(const std::string& Name,
+                           llvm::SmallVectorImpl<clang::Expr*>& NumDiffArgs,
+                           clang::Expr* CUDAExecConfig);
+    /// The callee the numerical-diff fallback passes to differentiate a call
+    /// to \p FD made through \p Callee: Callee itself, or a reference to the
+    /// library function a builtin stands for (see utils::GetNumDiffTarget).
+    /// Null when numerical differentiation is not viable for FD.
+    clang::Expr* GetNumDiffCallee(const clang::FunctionDecl* FD,
+                                  clang::Expr* Callee,
+                                  const clang::CallExpr* CE);
+    /// Warns at \p CE where it calls the term clad wrote to approximate a call
+    /// it could not differentiate: a derivative of the code it is in takes no
+    /// part from it, which would take derivatives of that call again. Once
+    /// for each call it approximated, in each derivative.
+    void warnIfNumDiffDerivative(const clang::CallExpr* CE);
+    /// Where warnIfNumDiffDerivative has warned.
+    llvm::DenseSet<clang::SourceLocation> m_NumDiffDerivativeWarned;
     /// A function to get the single argument "forward_central_difference"
     /// call expression for the given arguments.
     ///
@@ -934,12 +1033,18 @@ namespace clad {
     /// \param[in] targetPos The relative position of 'targetArg'.
     /// \param[in] numArgs The total number of 'args'.
     /// \param[in] args All the arguments to the target function.
+    /// \param[in] CUDAExecConfig The kernel launch configuration, if any.
+    /// \param[in] targetTangent The tangent of 'targetArg', if the call is to
+    /// give the partial derivative times it rather than the partial alone. A
+    /// vector of tangents still gets the partial alone, zero where each of
+    /// them is, for the caller to multiply.
     ///
     /// \returns The derivative function call.
     clang::Expr* GetSingleArgCentralDiffCall(
         clang::Expr* targetFuncCall, clang::Expr* targetArg, unsigned targetPos,
         unsigned numArgs, llvm::SmallVectorImpl<clang::Expr*>& args,
-        clang::Expr* CUDAExecConfig = nullptr);
+        clang::Expr* CUDAExecConfig = nullptr,
+        clang::Expr* targetTangent = nullptr);
 
     clang::QualType DetermineCladArrayValueType(clang::QualType T);
     /// Find the derived function if present in the DerivedFnCollector.
@@ -1012,6 +1117,18 @@ namespace clad {
     /// Builds the QualType of the derivative to be generated.
     ///
     clang::QualType GetDerivativeType();
+    /// The number of template tags the derivative takes first; see
+    /// utils::GetTemplateTagTypes.
+    unsigned getNumTemplateTags();
+    /// Builds the template tags of the derivative, unnamed, at the front of
+    /// \p params.
+    void PrependTemplateTagParams(
+        llvm::SmallVectorImpl<clang::ParmVarDecl*>& params);
+    /// Inserts at \p Pos of \p Args the tags a call to a derivative of
+    /// \p Callee passes.
+    void InsertTemplateTagArgs(const clang::FunctionDecl* Callee,
+                               llvm::SmallVectorImpl<clang::Expr*>& Args,
+                               unsigned Pos);
 
     /// Which flavour of overload CreateDerivativeOverload should build.
     ///

@@ -10,6 +10,7 @@
 #include "clad/Differentiator/CladUtils.h"
 #include "clad/Differentiator/Compatibility.h"
 #include "clad/Differentiator/DerivativeBuilder.h"
+#include "clad/Differentiator/DiffPlanner.h"
 #include "clad/Differentiator/ParseDiffArgsTypes.h"
 #include "clad/Differentiator/ReverseModeVisitorDirectionKinds.h"
 #include "clad/Differentiator/VisitorBase.h"
@@ -19,19 +20,24 @@
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/OpenMPClause.h"
+#include "clang/AST/OperationKinds.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/StmtOpenMP.h"
 #include "clang/AST/StmtVisitor.h"
+#include "clang/AST/Type.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/Specifiers.h"
 #include "clang/Basic/Version.h"
 #include "clang/Sema/Sema.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h" // IWYU pragma: keep -- function_ref on LLVM<14
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Casting.h"
 
 #include <array>
 #include <functional>
@@ -57,6 +63,7 @@ namespace clad {
 
   /// A visitor for processing the function code in reverse mode.
   /// Used to compute derivatives by clad::gradient.
+  /// \ingroup visitors
   class ReverseModeVisitor
       : public clang::ConstStmtVisitor<ReverseModeVisitor, StmtDiff>,
         public clang::ConstOMPClauseVisitor<ReverseModeVisitor,
@@ -78,9 +85,18 @@ namespace clad {
     /// will be executed on return.
     std::vector<Stmts> m_Reverse;
     /// Markers emitted at early-return sites in the forward block, patched
-    /// with `{ _rev(); return; }` at finalization, where `_rev` is the lambda
-    /// wrapping the master reverse sweep.
+    /// at finalization with a return from the forward-sweep closure.
     llvm::SmallPtrSet<clang::Stmt*, 4> m_EarlyReturnMarkers;
+    /// The early returns that the reverse sweep cannot tell were taken from
+    /// the condition of an enclosing `if`, numbered in the order they appear,
+    /// and the blocks whose statements come after one of them. The forward
+    /// sweep stores the number of such a return in m_ReturnedAt when it takes
+    /// it; the reverse sweep skips what came after.
+    llvm::DenseMap<const clang::ReturnStmt*, int> m_ReturnIds;
+    llvm::SmallPtrSet<const clang::CompoundStmt*, 4> m_ReturnGuardedBlocks;
+    clang::VarDecl* m_ReturnedAt = nullptr;
+    /// The globals the reverse sweep puts back around the calls it replays.
+    llvm::SetVector<const clang::VarDecl*> m_ReplayedGlobals;
     /// Storing expressions to delete/free memory in the reverse pass.
     Stmts m_DeallocExprs;
     /// A dfdx seed: eager expression, or a deferred builder materialized on
@@ -103,8 +119,19 @@ namespace clad {
     // Store the Tape-pop operations that will be inserted at the beginning of
     // the OpenMP reverse pass.
     Stmts m_OMPReverseBlocks;
-    /// A flag indicating if the Stmt we are currently visiting is inside loop.
-    bool isInsideLoop = false;
+    /// The loop the statement being visited sits in, or null outside any
+    /// loop. Defined in lib/Differentiator/LoopScope.h.
+    struct LoopScope;
+    LoopScope* m_CurrentLoop = nullptr;
+    /// Whether the reverse pass computes the initial value of \p VD again
+    /// when it enters an iteration, instead of storing it on a tape. The
+    /// analysis decides (see DiffRequest::isRecomputableInLoop); this switches
+    /// on the slots of the loops whose index the initializer reads.
+    bool canRecomputeInLoop(const clang::VarDecl* VD);
+    /// Whether a store in the statement being visited happens once per
+    /// iteration of a loop, and so has to go on a tape. False in a loop that
+    /// recomputes instead of taping.
+    [[nodiscard]] bool isInsideLoop() const;
     /// A flag indicating if the Stmt we are currently visiting is inside an
     /// OpenMP parallel region.
     bool isInsideOMPBlock = false;
@@ -115,6 +142,11 @@ namespace clad {
     /// break. It is used to determine whether to run the loop cond
     /// differentiation. One additional time.
     clang::Expr* m_CurrentBreakFlagExpr;
+    /// For each enclosing loop, innermost last, its adjoint iterator if it is
+    /// a range-for and null otherwise. Leaving an iteration by break or return
+    /// advances the iterator as finishing it would, so that the reverse sweep
+    /// steps it back once for every iteration the forward sweep entered.
+    llvm::SmallVector<clang::Expr*, 4> m_LoopAdjointIterators;
 
     clang::Expr* m_RestoreTracker = nullptr;
     /// A never-restored tracker handed to nested reverse_forw calls that only
@@ -147,6 +179,15 @@ namespace clad {
     /// forward sweep is fully assembled and before the body is handed to Sema.
     void
     patchEarlyReturnMarkers(llvm::function_ref<clang::Stmt*()> MakeReplacement);
+    /// Numbers the early returns of \p Body that a later statement of their
+    /// block does not see in the condition of an enclosing `if`, and declares
+    /// m_ReturnedAt if there are any.
+    void numberUngatedReturns(const clang::Stmt* Body);
+    /// Puts \p Reverse, the adjoint seed of the early return \p RS, into the
+    /// reverse sweep and returns the marker that patchEarlyReturnMarkers turns
+    /// into a return from the forward-sweep closure.
+    clang::Stmt* markEarlyReturn(const clang::ReturnStmt* RS,
+                                 clang::Stmt* Reverse);
 
   public:
     using direction = rmv::direction;
@@ -187,6 +228,8 @@ namespace clad {
         if (m_Taken)
           return m_RMV.CloneNode(m_Seed);
         m_Taken = true;
+        if (m_Seed->HasSideEffects(m_RMV.m_Context))
+          m_Seed = m_RMV.StoreAndRef(m_Seed, direction::reverse);
         return m_Seed;
       }
       explicit operator bool() const { return m_Seed != nullptr; }
@@ -329,6 +372,8 @@ namespace clad {
     ///
     /// \param[in] init The variable declaration initializer.
     ///
+    /// \param[in] SC The storage class of the variable declaration.
+    ///
     /// \returns A variable declaration that is already added to the
     /// global scope.
     clang::VarDecl* GlobalStoreImpl(clang::QualType Type,
@@ -350,9 +395,12 @@ namespace clad {
     clang::Expr* GlobalStoreAndRef(clang::Expr* E,
                                    llvm::StringRef prefix = "_t",
                                    bool force = false, bool zeroInit = false);
-    virtual StmtDiff StoreAndRestore(clang::Expr* E,
-                                     llvm::StringRef prefix = "_t",
-                                     bool moveToTape = false);
+    /// With \p restoreAgain, the restore leaves the record in place, and the
+    /// statements added to \p restoreAgain restore E from it once more and
+    /// then drop it.
+    virtual StmtDiff StoreAndRestore(
+        clang::Expr* E, llvm::StringRef prefix = "_t", bool moveToTape = false,
+        llvm::SmallVectorImpl<clang::Stmt*>* restoreAgain = nullptr);
 
     /// Build element-wise move between 2 arrays, e.g.
     /// `std::move(std::begin(from), std::end(from), std::begin(to));`
@@ -394,19 +442,23 @@ namespace clad {
     /// cloning LHS. The global variable will be assigned with the actual
     /// expression only later, after the expression is visited and rebuilt.
     /// This is what DelayedGlobalStoreAndRef does. E is expected to be the
-    /// original (uncloned) expression.
+    /// original (uncloned) expression. Where nothing will read the stored
+    /// value (\p isNeeded is false), E is not stored.
     virtual DelayedStoreResult
     DelayedGlobalStoreAndRef(clang::Expr* E, llvm::StringRef prefix = "_t",
-                             bool forceStore = false);
+                             bool forceStore = false, bool isNeeded = true);
 
     struct CladTapeResult {
       ReverseModeVisitor& V;
       clang::Expr* Push;
       clang::Expr* Pop;
       clang::Expr* Ref;
-      /// A request to get expr accessing last element in the tape
-      /// (clad::back(Ref)). Since it is required only rarely, it is built on
-      /// demand in the method.
+      /// For a store kept in an array slot rather than on a tape, the index
+      /// of each dimension, outermost loop first. Empty for a tape.
+      llvm::SmallVector<clang::Expr*, 2> Indices;
+      /// The stored value as either sweep reads it back: `clad::back(Ref)` on
+      /// a tape, the slot itself in an array. Built on demand; every call
+      /// clones, so no two uses share a node.
       clang::Expr* Last();
     };
 
@@ -419,11 +471,28 @@ namespace clad {
     ///
     /// \param[in] prefix The prefix value for the name of the tape.
     ///
+    /// \param[in] type The element type of the tape; deduced from \p E when
+    /// left empty.
+    ///
+    /// \param[in] AllowSlots Whether the store may take an array slot
+    /// instead, when every loop around it has a literal trip count (see
+    /// loopsForSlots). A caller that builds its own pushes from \p Ref
+    /// passes false.
+    ///
     /// \returns A struct containg necessary call expressions for the built
     /// tape
     CladTapeResult MakeCladTapeFor(clang::Expr* E,
                                    llvm::StringRef prefix = "_t",
-                                   clang::QualType type = {});
+                                   clang::QualType type = {},
+                                   bool AllowSlots = true);
+    /// Whether a store of \p Type made here may live in an array slot, and
+    /// if so the loops that index it, outermost first: each counted by the
+    /// analysis with a literal, and the array a few locals' worth of frame.
+    bool loopsForSlots(clang::QualType Type,
+                       llvm::SmallVectorImpl<LoopScope*>& Loops) const;
+    /// `Array[I0][I1]...` for the indices of a slot store, every node fresh.
+    clang::Expr* BuildSlot(clang::Expr* Array,
+                           llvm::ArrayRef<clang::Expr*> Indices);
 
     /// A function to get the multi-argument "central_difference"
     /// call expression for the given arguments.
@@ -437,8 +506,7 @@ namespace clad {
     /// before the call to the derived function.
     /// \param[in] args All the arguments to the target function.
     /// \param[in] outputArgs The output gradient arguments.
-    ///
-    /// \returns The derivative function call.
+    /// \param[in] CUDAExecConfig The kernel launch configuration, if any.
     void GetMultiArgCentralDiffCall(
         clang::Expr* targetFuncCall, clang::QualType retType, unsigned numArgs,
         clang::Expr* dfdx, llvm::SmallVectorImpl<clang::Stmt*>& PreCallStmts,
@@ -479,9 +547,12 @@ namespace clad {
     StmtDiff VisitCXXBindTemporaryExpr(const clang::CXXBindTemporaryExpr* BTE);
     StmtDiff VisitCharacterLiteral(const clang::CharacterLiteral* CL);
     StmtDiff VisitStringLiteral(const clang::StringLiteral* SL);
+    StmtDiff VisitConstantExpr(const clang::ConstantExpr* CE);
     StmtDiff VisitCXXDefaultArgExpr(const clang::CXXDefaultArgExpr* DE);
     virtual StmtDiff VisitDeclRefExpr(const clang::DeclRefExpr* DRE);
     StmtDiff VisitDeclStmt(const clang::DeclStmt* DS);
+    /// The declarations of \p DS, which are not a structured binding.
+    StmtDiff DifferentiateDeclStmt(const clang::DeclStmt* DS);
     StmtDiff VisitFloatingLiteral(const clang::FloatingLiteral* FL);
     StmtDiff VisitCXXForRangeStmt(const clang::CXXForRangeStmt* FRS);
     StmtDiff VisitForStmt(const clang::ForStmt* FS);
@@ -510,9 +581,11 @@ namespace clad {
     StmtDiff VisitOpaqueValueExpr(const clang::OpaqueValueExpr* OVE);
     virtual StmtDiff VisitReturnStmt(const clang::ReturnStmt* RS);
     StmtDiff VisitStmt(const clang::Stmt* S);
+    StmtDiff VisitAttributedStmt(const clang::AttributedStmt* S);
     virtual StmtDiff VisitUnaryOperator(const clang::UnaryOperator* UnOp);
     StmtDiff
     VisitUnaryExprOrTypeTraitExpr(const clang::UnaryExprOrTypeTraitExpr* UE);
+    StmtDiff VisitTypeTraitExpr(const clang::TypeTraitExpr* TTE);
     StmtDiff VisitExprWithCleanups(const clang::ExprWithCleanups* EWC);
     /// Decl is not Stmt, so it cannot be visited directly.
     StmtDiff VisitWhileStmt(const clang::WhileStmt* WS);
@@ -640,14 +713,22 @@ namespace clad {
     /// \param[in] isNonDiff true if the corresponding call is
     /// non-differentiable
     ///
+    /// \param[in] isCUDAKernel true if the call being differentiated is a
+    /// kernel launch
+    ///
+    /// \param[out] PostCallStmts If not null, the caller restores the
+    /// argument's writes itself: the restore before the pullback call keeps
+    /// the record, and the statements that restore the argument once more and
+    /// then drop the record are added here, to follow the pullback call.
+    ///
     /// \returns A triplet of differentiated arguments, i.e. ``{<original arg>,
     /// <arg for pullback>, <reverse_forw arg>}``. In practice, it will look
     /// somewhat like ``{x, &_r0, _d_x}``.
-    StmtDiff
-    DifferentiateCallArg(const clang::Expr* arg,
-                         const clang::ParmVarDecl* param,
-                         llvm::SmallVectorImpl<clang::Stmt*>& PreCallStmts,
-                         bool isNonDiff, bool isCUDAKernel = false);
+    StmtDiff DifferentiateCallArg(
+        const clang::Expr* arg, const clang::ParmVarDecl* param,
+        llvm::SmallVectorImpl<clang::Stmt*>& PreCallStmts, bool isNonDiff,
+        bool isCUDAKernel = false,
+        llvm::SmallVectorImpl<clang::Stmt*>* PostCallStmts = nullptr);
 
     /// Allows to easily create and manage a counter for counting the number of
     /// executed iterations of a loop.
@@ -657,15 +738,34 @@ namespace clad {
     /// If we are currently inside a loop, then a clad tape object is created
     /// to be used as the counter; otherwise, a temporary global variable (in
     /// function scope) is created to be used as the counter.
+    ///
+    /// When the caller can prove the iteration count from the loop's own
+    /// bounds (see DiffRequest::getLoopFacts), it passes that count here and
+    /// the forward sweep stops counting altogether: no reset, no per-iteration
+    /// increment, and -- for a nested loop -- no tape. The reverse loop then
+    /// assigns the count to a plain function-scope variable on entry.
     class LoopCounter {
       clang::Expr *m_Ref = nullptr;
       clang::Expr *m_Pop = nullptr;
       clang::Expr *m_Push = nullptr;
       ReverseModeVisitor& m_RMV;
       clang::VarDecl* m_numRevIterations = nullptr;
+      clang::Expr* m_TripCount = nullptr;
 
     public:
-      LoopCounter(ReverseModeVisitor& RMV);
+      LoopCounter(ReverseModeVisitor& RMV, clang::Expr* tripCount = nullptr,
+                  clang::QualType countType = {});
+
+      /// Returns true if the reverse sweep computes the iteration count from
+      /// the loop bounds instead of reading a count the forward sweep kept.
+      [[nodiscard]] bool isRecomputed() const { return m_TripCount; }
+
+      /// Returns `counter = <trip count>`, the init of the reverse loop.
+      /// Only valid when isRecomputed().
+      [[nodiscard]] clang::Expr* getCounterInit() const {
+        return m_RMV.BuildOp(clang::BinaryOperatorKind::BO_Assign, cloneRef(),
+                             m_TripCount);
+      }
       /// Returns `clad::push(_t, 0UL)` expression if clad tape is used
       /// for counter; otherwise, returns nullptr.
       clang::Expr* getPush() const { return m_Push; }
@@ -683,8 +783,11 @@ namespace clad {
         return m_RMV.CloneNode(m_Ref);
       }
 
-      /// Returns counter post-increment expression (`counter++`).
+      /// Returns counter post-increment expression (`counter++`), or nullptr
+      /// when the count is recomputed and the forward sweep must not count.
       clang::Expr* getCounterIncrement() {
+        if (isRecomputed())
+          return nullptr;
         return m_RMV.BuildOp(clang::UnaryOperatorKind::UO_PostInc, cloneRef());
       }
 
@@ -713,12 +816,13 @@ namespace clad {
     ///
     ///\param[in] body body of the loop
     ///\param[in] loopCounter associated `LoopCounter` object of the loop.
-    ///\param[in] condVarDiff derived statements of the condition
+    ///\param[in] condVarDifff derived statements of the condition
     /// variable, if any.
     ///\param[in] forLoopIncDiff derived statements of the `for` loop
     /// increment statement, if any.
     ///\param[in] isForLoop should be true if we are differentiating a `for`
     /// loop body; otherwise false.
+    ///\param[in] loopLoc the location of the loop being differentiated.
     ///\returns {forward pass statements, reverse pass statements} for the loop
     /// body.
     StmtDiff DifferentiateLoopBody(
@@ -792,6 +896,9 @@ namespace clad {
       /// control-flow tape. Lets VisitBreakStmt pick the right handling.
       bool m_IsInvokedBySwitchStmt = false;
 
+      /// The body of the loop this handles, or null for a switch.
+      const clang::Stmt* m_LoopBody = nullptr;
+
       BreakContStmtHandler(ReverseModeVisitor& RMV, bool forSwitchStmt = false)
           : m_RMV(RMV), m_IsInvokedBySwitchStmt(forSwitchStmt) {}
 
@@ -842,7 +949,7 @@ namespace clad {
     ///
     /// Multiple external RMV source can be registered by calling this function
     /// multiple times.
-    ///\paramp[in] source An external RMV source
+    ///\param[in] source An external RMV source
     void AddExternalSource(ExternalRMVSource& source);
 
     clang::QualType GetLambdaDerivativeType(const clang::LambdaExpr* LE) {
@@ -851,11 +958,28 @@ namespace clad {
       for (const auto* param : FD->parameters())
         diffParams.push_back(param);
 
-      return utils::GetDerivativeType(m_Sema, FD, DiffMode::pullback,
-                                      diffParams,
-                                      /*forCustomDerv=*/false,
-                                      /*shouldUseRestoreTracker=*/false);
+      clang::QualType baseTy =
+          utils::GetDerivativeType(m_Sema, FD, DiffMode::pullback, diffParams,
+                                   /*forCustomDerv=*/false,
+                                   /*shouldUseRestoreTracker=*/false);
+      if (LE->capture_size() == 0)
+        return baseTy;
+      clang::ASTContext& C = m_Sema.getASTContext();
+      const auto* FPT = baseTy->castAs<clang::FunctionProtoType>();
+      llvm::SmallVector<clang::QualType, 8> paramTypes(
+          FPT->param_types().begin(), FPT->param_types().end());
+      for (const clang::LambdaCapture& Capture : LE->captures()) {
+        const auto* capVD =
+            llvm::cast<clang::VarDecl>(Capture.getCapturedVar());
+        clang::QualType valTy = utils::getNonConstType(
+            capVD->getType().getNonReferenceType(), m_Sema);
+        paramTypes.push_back(valTy);
+        paramTypes.push_back(C.getPointerType(valTy));
+      }
+      return C.getFunctionType(FPT->getReturnType(), paramTypes,
+                               FPT->getExtProtoInfo());
     }
+    /// Builds the pullback lambda for LE
     clang::Expr* buildDerivedLambda(const clang::LambdaExpr* LE);
     /// Builds and returns the sequence of derived function parameters.
     void BuildParams(llvm::SmallVectorImpl<clang::ParmVarDecl*>& params,
@@ -899,6 +1023,13 @@ namespace clad {
     /// returns the label chain to prepend before the group's adjoint replay.
     clang::Stmt* CloseReverseSwitchCaseGroup(SwitchStmtInfo& SSData);
 
+    /// Differentiates \p Sub, the statement a case label of the original
+    /// labels, and labels its forward code with \p SC. The label takes the
+    /// first of the statements that code is made of and the rest follow it,
+    /// so a value stored before the statement is stored before it runs.
+    void DifferentiateSwitchCaseBody(clang::SwitchCase* SC,
+                                     const clang::Stmt* Sub);
+
   private:
     // When differentiating ArrayInitLoopExpr, we need to replace
     // ArrayInitIndexExpr with real indices. We need to both add and pop them in
@@ -916,8 +1047,30 @@ namespace clad {
     // style. Remove this once we generate constructors explicitly.
     bool m_TrackVarDeclConstructor = false;
 
-    /// A flag indicating if the Stmt is contained in a checkpointed loop.
-    bool m_IsInsideCheckpointedLoop = false;
+    /// The two expressions a counted loop's reverse sweep needs. What the
+    /// loop *is* -- its index, its bounds, whether they hold still -- belongs
+    /// to the request, not here; this is only what had to be built from it.
+    struct CountedLoopCode {
+      /// The iterations the loop performs, as an expression the reverse sweep
+      /// can evaluate on entry. Null when that could not be proven, in which
+      /// case the forward sweep has to count them.
+      clang::Expr* TripCount = nullptr;
+      /// The type TripCount and the counter that holds it are declared with.
+      clang::QualType CountType;
+      /// What the induction variable holds once the loop has exited.
+      clang::Expr* IndVarEnd = nullptr;
+    };
+
+    /// Recognises the counted loop -- an integer variable stepped by one from
+    /// a stable initial value while it stays below a stable bound, with no
+    /// early exit -- and nothing else.
+    CountedLoopCode BuildCountedLoop(const LoopFacts& F);
+
+    /// The loop index whose value the forward sweep need not save before
+    /// overwriting it. A member because the statement that would save it is
+    /// differentiated several calls down, with no parameter of its own to
+    /// carry this; set only while that one statement is being visited.
+    const clang::VarDecl* m_UnsavedLoopIndex = nullptr;
   };
 } // end namespace clad
 

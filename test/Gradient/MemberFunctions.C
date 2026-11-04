@@ -5,8 +5,6 @@
 
 #include "clad/Differentiator/Differentiator.h"
 
-#define elidable_reverse_forw __attribute__((annotate("elidable_reverse_forw")))
-
 class SimpleFunctions {
 public:
   SimpleFunctions(double p_x = 0, double p_y = 0) : x(p_x), y(p_y) {}
@@ -360,14 +358,13 @@ public:
   // CHECK-NEXT:         _d_this->y += 1 * i;
   // CHECK-NEXT:         *_d_i += (this->x + this->y) * 1;
   // CHECK-NEXT:         *_d_i += 1 * j;
-  // CHECK-NEXT:         _d_j += i * 1;
   // CHECK-NEXT:     }
   // CHECK-NEXT: }
 
 
   static double static_mem_fn(double u, double v) { return u + v; }
   
-  // CHECK: static inline void static_mem_fn_grad(double u, double v, double *_d_u, double *_d_v) {
+  // CHECK: static void static_mem_fn_grad(double u, double v, double *_d_u, double *_d_v) {
   // CHECK-NEXT:     {
   // CHECK-NEXT:         *_d_u += 1;
   // CHECK-NEXT:         *_d_v += 1;
@@ -557,11 +554,11 @@ class SafeTestClass {
 namespace clad {
 namespace custom_derivatives {
 namespace class_functions {
-    clad::ValueAndAdjoint<SafeTestClass, SafeTestClass>
-    constructor_reverse_forw(clad::Tag<SafeTestClass>, double x, double* y, double d_x, double* d_y) elidable_reverse_forw;
+    CLAD_ELIDABLE_REVERSE_FORW clad::ValueAndAdjoint<SafeTestClass, SafeTestClass>
+    constructor_reverse_forw(clad::Tag<SafeTestClass>, double x, double* y, double d_x, double* d_y);
     
-    clad::ValueAndAdjoint<SafeTestClass, SafeTestClass>
-    constructor_reverse_forw(clad::Tag<SafeTestClass>, double &x, double &d_x) elidable_reverse_forw;
+    CLAD_ELIDABLE_REVERSE_FORW clad::ValueAndAdjoint<SafeTestClass, SafeTestClass>
+    constructor_reverse_forw(clad::Tag<SafeTestClass>, double &x, double &d_x);
 
     clad::ValueAndAdjoint<SafeTestClass, SafeTestClass>
     constructor_reverse_forw(clad::Tag<SafeTestClass>) {
@@ -635,31 +632,35 @@ double fn8(double x, double y) {
 }
 
 // CHECK:  void fn8_grad(double x, double y, double *_d_x, double *_d_y) {
-// CHECK-NEXT:      S _d_s = {0., false};
-// CHECK-NEXT:      S s = {x, false};
-// CHECK-NEXT:      auto _rev0 = [&] {
-// CHECK-NEXT:          if (s.Cond(y))
-// CHECK-NEXT:              ;
-// CHECK-NEXT:          *_d_x += _d_s.val;
-// CHECK-NEXT:      };
-// CHECK-NEXT:      if (s.Cond(y)) {
-// CHECK-NEXT:          _rev0();
-// CHECK-NEXT:          return;
-// CHECK-NEXT:      }
-// CHECK-NEXT:      *_d_y += 1;
-// CHECK-NEXT:      _rev0();
-// CHECK-NEXT:  }
+// CHECK-NEXT:     S _d_s = {0., false};
+// CHECK-NEXT:     S s = {x, false};
+// CHECK-NEXT:     clad::forward_sweep([&] {
+// CHECK-NEXT:         if (s.Cond(y))
+// CHECK-NEXT:             return;
+// CHECK-NEXT:         *_d_y += 1;
+// CHECK-NEXT:     });
+// CHECK-NEXT:     if (s.Cond(y))
+// CHECK-NEXT:         ;
+// CHECK-NEXT:     *_d_x += _d_s.val;
+// CHECK-NEXT: }
 
 double fn9(double x, double y) {
   S* s = new S{x, false};
-  return s->getVal();
+  double res = s->getVal();
+  delete s;
+  return res;
 }
 
 // CHECK:  void fn9_grad(double x, double y, double *_d_x, double *_d_y) {
 // CHECK-NEXT:      S *_d_s = new S({0., false});
 // CHECK-NEXT:      S *s = new S({x, false});
-// CHECK-NEXT:      s->getVal_pullback(1, _d_s);
-// CHECK-NEXT:      *_d_x += *_d_s.val;
+// CHECK-NEXT:      double _d_res = 0.;
+// CHECK-NEXT:      double res = s->getVal();
+// CHECK-NEXT:      _d_res += 1;
+// CHECK-NEXT:      s->getVal_pullback(_d_res, _d_s);
+// CHECK-NEXT:      *_d_x += (*_d_s).val;
+// CHECK-NEXT:      delete s;
+// CHECK-NEXT:      delete _d_s;
 // CHECK-NEXT:  }
 
 // CHECK:  void operator_minus_pullback(const double &x, S _d_y, S *_d_this, double *_d_x) const {
@@ -736,7 +737,6 @@ double fn11(double u, double v) {
 // CHECK-NEXT:      a.setData(u);
 // CHECK-NEXT:      res += a.data * v;
 // CHECK-NEXT:      _tracker0.clear();
-// CHECK-NEXT:      a.increment_reverse_forw(&_d_a, _tracker0);
 // CHECK-NEXT:      _d_res += 1;
 // CHECK-NEXT:      {
 // CHECK-NEXT:          _tracker0.restore();
@@ -785,6 +785,101 @@ float fn12(const B b, const float* in) {
 // CHECK-NEXT:      b.scale_pullback(in, &res, _d_b, &_d_res);
 // CHECK-NEXT:  }
 
+struct C {
+  double d[2];
+  const double* data() const { return d; }
+};
+
+double prod(const double* a) { return a[0] * a[1]; }
+
+double fn13(double x) {
+  C c;
+  c.d[0] = x;
+  c.d[1] = x;
+  return prod(c.data());
+}
+
+// CHECK:  void prod_pullback(const double *a, double _d_y, double *_d_a) {
+// CHECK-NEXT:      {
+// CHECK-NEXT:          _d_a[0] += _d_y * a[1];
+// CHECK-NEXT:          _d_a[1] += a[0] * _d_y;
+// CHECK-NEXT:      }
+// CHECK-NEXT:  }
+
+// CHECK:  clad::ValueAndAdjoint<const double *, double *> data_reverse_forw(C *_d_this) const {
+// CHECK-NEXT:      return {this->d, _d_this->d};
+// CHECK-NEXT:  }
+
+// CHECK:  void fn13_grad(double x, double *_d_x) {
+// CHECK-NEXT:      C _d_c = {{.*}};
+// CHECK-NEXT:      C c;
+// CHECK-NEXT:      c.d[0] = x;
+// CHECK-NEXT:      c.d[1] = x;
+// CHECK-NEXT:      clad::ValueAndAdjoint<const double *, double *> _t0 = c.data_reverse_forw(&_d_c);
+// CHECK-NEXT:      prod_pullback(_t0.value, 1, _t0.adjoint);
+// CHECK-NEXT:      {
+// CHECK-NEXT:          double _r_d1 = _d_c.d[1];
+// CHECK-NEXT:          _d_c.d[1] = 0.;
+// CHECK-NEXT:          *_d_x += _r_d1;
+// CHECK-NEXT:      }
+// CHECK-NEXT:      {
+// CHECK-NEXT:          double _r_d0 = _d_c.d[0];
+// CHECK-NEXT:          _d_c.d[0] = 0.;
+// CHECK-NEXT:          *_d_x += _r_d0;
+// CHECK-NEXT:      }
+// CHECK-NEXT:  }
+
+struct D {
+  int value;
+  const int* func() const { return &value; }
+};
+
+double fn14(double x) {
+  D d;
+  d.value = 3;
+  return x * *d.func();
+}
+
+// CHECK:  clad::ValueAndAdjoint<const int *, int *> func_reverse_forw(D *_d_this) const {
+// CHECK-NEXT:      return {&this->value, &_d_this->value};
+// CHECK-NEXT:  }
+
+// CHECK:  void fn14_grad(double x, double *_d_x) {
+// CHECK-NEXT:      D _d_d = {0};
+// CHECK-NEXT:      D d;
+// CHECK-NEXT:      d.value = 3;
+// CHECK-NEXT:      clad::ValueAndAdjoint<const int *, int *> _t0 = d.func_reverse_forw(&_d_d);
+// CHECK-NEXT:      clad::ValueAndAdjoint<const int *, int *> _t1 = d.func_reverse_forw(&_d_d);
+// CHECK-NEXT:      {
+// CHECK-NEXT:          *_d_x += 1 * *_t0.value;
+// CHECK-NEXT:          *_t1.adjoint += x * 1;
+// CHECK-NEXT:      }
+// CHECK-NEXT:      {
+// CHECK-NEXT:          int _r_d0 = _d_d.value;
+// CHECK-NEXT:          _d_d.value = 0;
+// CHECK-NEXT:      }
+// CHECK-NEXT:  }
+
+// A derivative declared in a class nested in a namespace and a class.
+namespace phys {
+struct Body {
+  class Weight {
+    double m_k = 3;
+
+  public:
+    double scale(double x) const { return m_k * x * x; }
+    void scale_pullback(double x, double _d_y, Weight* _d_this,
+                        double* _d_x) const;
+  };
+};
+} // namespace phys
+double fn15(double x) {
+  phys::Body::Weight w;
+  return w.scale(x);
+}
+
+// CHECK: void phys::Body::Weight::scale_pullback(double x, double _d_y, phys::Body::Weight *_d_this, double *_d_x) const {
+
 int main() {
   auto d_mem_fn = clad::gradient(&SimpleFunctions::mem_fn);
   auto d_const_mem_fn = clad::gradient(&SimpleFunctions::const_mem_fn);
@@ -822,6 +917,14 @@ int main() {
 
   SimpleFunctions sf1(2, 3), sf2(3, 4), sf3(4, 5);
   SimpleFunctions d_sf;
+
+  // A gradient of a member function is itself a member function, so it needs a
+  // base object to be called on. Pass it as the first argument to execute.
+  SimpleFunctions mem_fn_base(2, 3), d_mem_fn_base;
+  double d_mem_i = 0, d_mem_j = 0;
+  d_mem_fn.execute(mem_fn_base, 4, 5, &d_mem_fn_base, &d_mem_i, &d_mem_j);
+  printf("{%.2f, %.2f, %.2f, %.2f}\n", d_mem_i, d_mem_j, d_mem_fn_base.x,
+         d_mem_fn_base.y); //CHECK-EXEC: {10.00, 4.00, 4.00, 4.00}
 
   auto d_fn2 = clad::gradient(fn2);
   d_fn2.execute(sf1, 2, &d_sf, &result[0]);
@@ -876,6 +979,21 @@ int main() {
   auto d_fn12 = clad::gradient(fn12, "0");
   d_fn12.execute(b, &in, &d_b);
   printf("%.2f", d_b.m); //CHECK-EXEC: 2.00
+
+  auto d_fn13 = clad::gradient(fn13);
+  double d_fn13_x = 0;
+  d_fn13.execute(3, &d_fn13_x);
+  printf("%.2f", d_fn13_x); //CHECK-EXEC: 6.00
+
+  auto d_fn14 = clad::gradient(fn14);
+  double d_fn14_x = 0;
+  d_fn14.execute(2, &d_fn14_x);
+  printf("%.2f", d_fn14_x); //CHECK-EXEC: 3.00
+
+  auto d_fn15 = clad::gradient(fn15);
+  double d_fn15_x = 0;
+  d_fn15.execute(2, &d_fn15_x);
+  printf("%.2f", d_fn15_x); //CHECK-EXEC: 12.00
   
   auto d_const_volatile_lval_ref_mem_fn_i = clad::gradient(&SimpleFunctions::const_volatile_lval_ref_mem_fn, "i");
 
@@ -887,7 +1005,6 @@ int main() {
   // CHECK-NEXT:           _d_this->y += 1 * i;
   // CHECK-NEXT:           *_d_i += _t0 * 1;
   // CHECK-NEXT:           *_d_i += 1 * j;
-  // CHECK-NEXT:           _d_j += i * 1;
   // CHECK-NEXT:       }
   // CHECK-NEXT:   }
 
@@ -895,12 +1012,9 @@ int main() {
 
   // CHECK:   void const_volatile_rval_ref_mem_fn_grad_1(double i, double j, volatile SimpleFunctions *_d_this, double *_d_j) const volatile && {
   // CHECK-NEXT:       double _d_i = 0.;
-  // CHECK-NEXT:       double _t0 = (this->x + this->y);
   // CHECK-NEXT:       {
   // CHECK-NEXT:           _d_this->x += 1 * i;
   // CHECK-NEXT:           _d_this->y += 1 * i;
-  // CHECK-NEXT:           _d_i += _t0 * 1;
-  // CHECK-NEXT:           _d_i += 1 * j;
   // CHECK-NEXT:           *_d_j += i * 1;
   // CHECK-NEXT:       }
   // CHECK-NEXT:   }

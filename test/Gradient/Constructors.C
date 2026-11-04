@@ -35,7 +35,10 @@ double fn1(double x, double y) {
 // CHECK-NEXT:     _this->x = val;
 // CHECK-NEXT:     val *= val;
 // CHECK-NEXT:     _this->y = val;
-// CHECK-NEXT:     return {*_this, *_d_this};
+// CHECK-NEXT:     clad::ValueAndAdjoint<argByVal, argByVal> _ret0 = {*_this, *_d_this};
+// CHECK-NEXT:     free(_this);
+// CHECK-NEXT:     free(_d_this);
+// CHECK-NEXT:     return _ret0;
 // CHECK-NEXT: }
 
 // CHECK:  static inline void constructor_pullback(double val, argByVal *_d_this, double *_d_val) {
@@ -134,7 +137,10 @@ double fn2(double u, double v) {
 // CHECK-NEXT:      memset(_d_this, 0, sizeof(S1));
 // CHECK-NEXT:      _this->p = x;
 // CHECK-NEXT:      _this->d = 0.;
-// CHECK-NEXT:      return {*_this, *_d_this};
+// CHECK-NEXT:      clad::ValueAndAdjoint<S1, S1> _ret0 = {*_this, *_d_this};
+// CHECK-NEXT:      free(_this);
+// CHECK-NEXT:      free(_d_this);
+// CHECK-NEXT:      return _ret0;
 // CHECK-NEXT:  }
 
 // CHECK:  static inline void constructor_pullback(double x, S1 *_d_this, double *_d_x) {
@@ -152,7 +158,10 @@ double fn2(double u, double v) {
 // CHECK-NEXT:     _this->p = x;
 // CHECK-NEXT:     _this->i = 1.;
 // CHECK-NEXT:     _this->d = 0.;
-// CHECK-NEXT:     return {*_this, *_d_this};
+// CHECK-NEXT:     clad::ValueAndAdjoint<S2, S2> _ret0 = {*_this, *_d_this};
+// CHECK-NEXT:     free(_this);
+// CHECK-NEXT:     free(_d_this);
+// CHECK-NEXT:     return _ret0;
 // CHECK-NEXT: }
 
 // CHECK:  static inline void constructor_pullback(double x, S2 *_d_this, double *_d_x) {
@@ -174,7 +183,10 @@ double fn2(double u, double v) {
 // CHECK-NEXT:     S3 *_d_this = (S3 *)malloc(sizeof(S3));
 // CHECK-NEXT:     memset(_d_this, 0, sizeof(S3));
 // CHECK-NEXT:     _this->p = x * x;
-// CHECK-NEXT:     return {*_this, *_d_this};
+// CHECK-NEXT:     clad::ValueAndAdjoint<S3, S3> _ret0 = {*_this, *_d_this};
+// CHECK-NEXT:     free(_this);
+// CHECK-NEXT:     free(_d_this);
+// CHECK-NEXT:     return _ret0;
 // CHECK-NEXT: }
 
 // CHECK:  static inline void constructor_pullback(double x, S3 *_d_this, double *_d_x) {
@@ -193,7 +205,10 @@ double fn2(double u, double v) {
 // CHECK-NEXT:     S5 *_this = (S5 *)malloc(sizeof(S5));
 // CHECK-NEXT:     S5 *_d_this = (S5 *)malloc(sizeof(S5));
 // CHECK-NEXT:     memset(_d_this, 0, sizeof(S5));
-// CHECK-NEXT:     return {*_this, *_d_this};
+// CHECK-NEXT:     clad::ValueAndAdjoint<S5, S5> _ret0 = {*_this, *_d_this};
+// CHECK-NEXT:     free(_this);
+// CHECK-NEXT:     free(_d_this);
+// CHECK-NEXT:     return _ret0;
 // CHECK-NEXT: }
 
 // CHECK:  static inline void constructor_pullback(double x, S5 *_d_this, double *_d_x) {
@@ -247,7 +262,10 @@ double fn3(double u, double v) {
 // CHECK-NEXT:    memset(_d_this, 0, sizeof(S4));
 // CHECK-NEXT:    _this->i = 9;
 // CHECK-NEXT:    _this->p = x;
-// CHECK-NEXT:    return {*_this, *_d_this};
+// CHECK-NEXT:    clad::ValueAndAdjoint<S4, S4> _ret0 = {*_this, *_d_this};
+// CHECK-NEXT:    free(_this);
+// CHECK-NEXT:    free(_d_this);
+// CHECK-NEXT:    return _ret0;
 // CHECK-NEXT:}
 
 // CHECK: static inline void constructor_pullback(double x, S4 *_d_this, double *_d_x) {
@@ -342,8 +360,9 @@ double fn5(double x, double y) {
 // CHECK-NEXT:  }
 
 // CHECK:  void fn5_grad(double x, double y, double *_d_x, double *_d_y) {
-// CHECK-NEXT:      argByValWrapper g(x);
-// CHECK-NEXT:      argByValWrapper _d_g(0.);
+// CHECK-NEXT:      clad::ValueAndAdjoint<argByValWrapper, argByValWrapper> _t0 = argByValWrapper::constructor_reverse_forw(clad::Tag<argByValWrapper>(), x, 0.);
+// CHECK-NEXT:      argByValWrapper g(_t0.value);
+// CHECK-NEXT:      argByValWrapper _d_g(_t0.adjoint);
 // CHECK-NEXT:      y = x;
 // CHECK-NEXT:      {
 // CHECK-NEXT:          *_d_y += 1;
@@ -369,14 +388,19 @@ double fn6(double x, double y) {
 // CHECK-NEXT:     argByValWrapper *_this = (argByValWrapper *)malloc(sizeof(argByValWrapper));
 // CHECK-NEXT:     argByValWrapper *_d_this = (argByValWrapper *)malloc(sizeof(argByValWrapper));
 // CHECK-NEXT:     memset(_d_this, 0, sizeof(argByValWrapper));
-// CHECK-NEXT:     new (_this) argByValWrapper(v);
+// CHECK-NEXT:     clad::ValueAndAdjoint<argByValWrapper, argByValWrapper> _t0 = argByValWrapper::constructor_reverse_forw(clad::Tag<argByValWrapper>(), v, 0.);
+// CHECK-NEXT:     new (_this) argByValWrapper(_t0.value);
 // CHECK-NEXT:     _this->z = _this->y * u;
-// CHECK-NEXT:     return {*_this, *_d_this};
+// CHECK-NEXT:     clad::ValueAndAdjoint<argByValWrapper, argByValWrapper> _ret0 = {*_this, *_d_this};
+// CHECK-NEXT:     free(_this);
+// CHECK-NEXT:     free(_d_this);
+// CHECK-NEXT:     return _ret0;
 // CHECK-NEXT: }
 
 // CHECK:  static inline void constructor_pullback(double v, double u, argByValWrapper *_d_this, double *_d_v, double *_d_u) {
 // CHECK-NEXT:      argByValWrapper *_this = (argByValWrapper *)malloc(sizeof(argByValWrapper));
-// CHECK-NEXT:      new (_this) argByValWrapper(v);
+// CHECK-NEXT:      clad::ValueAndAdjoint<argByValWrapper, argByValWrapper> _t0 = argByValWrapper::constructor_reverse_forw(clad::Tag<argByValWrapper>(), v, 0.);
+// CHECK-NEXT:      new (_this) argByValWrapper(_t0.value);
 // CHECK-NEXT:      _this->z = _this->y * u;
 // CHECK-NEXT:      {
 // CHECK-NEXT:          double _r_d0 = _d_this->z;
@@ -418,7 +442,10 @@ double fn7(double x, double y) {
 // CHECK-NEXT:     clad::ValueAndAdjoint<argByVal, argByVal> _t0 = argByVal::constructor_reverse_forw(clad::Tag<argByVal>(), v, 0.);
 // CHECK-NEXT:     new (static_cast<argByVal *>(_this)) argByVal(_t0.value);
 // CHECK-NEXT:     _this->z = _this->x * _this->y;
-// CHECK-NEXT:     return {*_this, *_d_this};
+// CHECK-NEXT:     clad::ValueAndAdjoint<argByValWrapper, argByValWrapper> _ret0 = {*_this, *_d_this};
+// CHECK-NEXT:     free(_this);
+// CHECK-NEXT:     free(_d_this);
+// CHECK-NEXT:     return _ret0;
 // CHECK-NEXT: }
 
 // CHECK:  static inline void constructor_pullback(double v, bool arg, argByValWrapper *_d_this, double *_d_v, bool *_d_arg) {
@@ -653,7 +680,10 @@ class ptrConstr {
 // CHECK-NEXT:      _this->ptr = &x;
 // CHECK-NEXT:      _d_this->ptr = &_d_x;
 // CHECK-NEXT:      _this->val = y * y;
-// CHECK-NEXT:      return {*_this, *_d_this};
+// CHECK-NEXT:      clad::ValueAndAdjoint<ptrConstr, ptrConstr> _ret0 = {*_this, *_d_this};
+// CHECK-NEXT:      free(_this);
+// CHECK-NEXT:      free(_d_this);
+// CHECK-NEXT:      return _ret0;
 // CHECK-NEXT:  }
 
 // CHECK:  static inline void constructor_pullback(double &x, const double &y, ptrConstr *_d_this, double *_d_x, double *_d_y) {
@@ -692,6 +722,137 @@ double fn13(double x, double y) {
 // CHECK-NEXT:      }
 // CHECK-NEXT:  }
 
+// By-value construction from named class objects must clone each argument
+// DeclRef so the derivative is a tree (no shared AST node).
+struct Point {
+  double x, y;
+  Point(double x_ = 0, double y_ = 0) : x(x_), y(y_) {}
+};
+
+struct Segment {
+  Point a, b;
+  Segment(Point a_, Point b_) : a(a_), b(b_) {}
+};
+
+double fn14(double x, double y) {
+  Point p(x, y);
+  Point q(0, 0);
+  Segment s(q, p);
+  return s.b.x + s.a.y;
+}
+
+// CHECK: void fn14_grad(double x, double y, double *_d_x, double *_d_y) {
+
+double fn15(double x, double y) {
+  Point p = Point(x, x * y);
+  return p.y;
+} // x * y
+
+// CHECK: void fn15_grad(double x, double y, double *_d_x, double *_d_y) {
+// CHECK-NEXT:     Point p = Point(x, x * y);
+// CHECK-NEXT:     Point _d_p = Point(0., 0.);
+// CHECK-NEXT:     _d_p.y += 1;
+// CHECK-NEXT:     {
+// CHECK-NEXT:         double _r0 = 0.;
+// CHECK-NEXT:         double _r1 = 0.;
+// CHECK-NEXT:         Point::constructor_pullback(x, x * y, &_d_p, &_r0, &_r1);
+// CHECK-NEXT:         *_d_x += _r0;
+// CHECK-NEXT:         *_d_x += _r1 * y;
+// CHECK-NEXT:         *_d_y += x * _r1;
+// CHECK-NEXT:     }
+// CHECK-NEXT: }
+
+struct NoDefaultPoint {
+  double a, b;
+  NoDefaultPoint(double a_, double b_) : a(a_), b(b_) {}
+};
+
+double fn16(double x, double y) {
+  NoDefaultPoint p = NoDefaultPoint(x, x * y);
+  NoDefaultPoint q = NoDefaultPoint{x * y, y};
+  NoDefaultPoint r(NoDefaultPoint(x * y, y));
+  return p.b + q.a + r.a;
+}
+
+// CHECK: void fn16_grad(double x, double y, double *_d_x, double *_d_y) {
+// CHECK-NEXT:     NoDefaultPoint p = NoDefaultPoint(x, x * y);
+// CHECK-NEXT:     NoDefaultPoint _d_p = NoDefaultPoint(0., 0.);
+// CHECK-NEXT:     NoDefaultPoint q = NoDefaultPoint{x * y, y};
+// CHECK-NEXT:     NoDefaultPoint _d_q = NoDefaultPoint{0., 0.};
+// CHECK-NEXT:     NoDefaultPoint r(NoDefaultPoint(x * y, y));
+// CHECK-NEXT:     NoDefaultPoint _d_r(NoDefaultPoint(0., 0.));
+// CHECK-NEXT:     {
+// CHECK-NEXT:         _d_p.b += 1;
+// CHECK-NEXT:         _d_q.a += 1;
+// CHECK-NEXT:         _d_r.a += 1;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     {
+// CHECK-NEXT:         double _r4 = 0.;
+// CHECK-NEXT:         double _r5 = 0.;
+// CHECK-NEXT:         NoDefaultPoint::constructor_pullback(x * y, y, &_d_r, &_r4, &_r5);
+// CHECK-NEXT:         *_d_x += _r4 * y;
+// CHECK-NEXT:         *_d_y += x * _r4;
+// CHECK-NEXT:         *_d_y += _r5;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     {
+// CHECK-NEXT:         double _r2 = 0.;
+// CHECK-NEXT:         double _r3 = 0.;
+// CHECK-NEXT:         NoDefaultPoint::constructor_pullback(x * y, y, &_d_q, &_r2, &_r3);
+// CHECK-NEXT:         *_d_x += _r2 * y;
+// CHECK-NEXT:         *_d_y += x * _r2;
+// CHECK-NEXT:         *_d_y += _r3;
+// CHECK-NEXT:     }
+// CHECK-NEXT:     {
+// CHECK-NEXT:         double _r0 = 0.;
+// CHECK-NEXT:         double _r1 = 0.;
+// CHECK-NEXT:         NoDefaultPoint::constructor_pullback(x, x * y, &_d_p, &_r0, &_r1);
+// CHECK-NEXT:         *_d_x += _r0;
+// CHECK-NEXT:         *_d_x += _r1 * y;
+// CHECK-NEXT:         *_d_y += x * _r1;
+// CHECK-NEXT:     }
+// CHECK-NEXT: }
+
+// A member initialized by a new-expression, which the derivatives of the
+// constructor clone.
+struct HeapBuf {
+  double* p;
+  HeapBuf(int k, double v) : p(new double[k]()) { p[0] = v; }
+};
+
+// CHECK: static inline clad::ValueAndAdjoint<HeapBuf, HeapBuf> constructor_reverse_forw(clad::Tag<HeapBuf>, int k, double v, int _d_k, double _d_v) {
+// CHECK-NEXT:     HeapBuf *_this = (HeapBuf *)malloc(sizeof(HeapBuf));
+// CHECK-NEXT:     HeapBuf *_d_this = (HeapBuf *)malloc(sizeof(HeapBuf));
+// CHECK-NEXT:     memset(_d_this, 0, sizeof(HeapBuf));
+// CHECK-NEXT:     _this->p = new double [k](/*implicit*/(double[])0);
+// CHECK-NEXT:     _d_this->p = new double [k](/*implicit*/(double[])0);
+// CHECK-NEXT:     _this->p[0] = v;
+
+double fn17(double x, double y) {
+  HeapBuf b(2, x);
+  double r = b.p[0] * y;
+  delete[] b.p;
+  return r;
+}
+
+// A base built by a constructor that does more than copy its arguments: the
+// adjoint of the object is not built by running it again on zero adjoints,
+// which here would divide by zero.
+struct Sliced {
+  double ds;
+  int nslice;
+  double inv;
+  Sliced(double d, int n) : ds(d), nslice(n) { inv = 1. / nslice; }
+};
+struct ShiftedSlices : Sliced {
+  double dx;
+  ShiftedSlices(double d, int n, double x) : Sliced(d, n), dx(x) {}
+  double step() const { return ds * inv + dx; }
+};
+double fn18(double i, double j) {
+  ShiftedSlices s(i, 4, j);
+  return s.step() * i;
+}
+
 int main() {
     double d_i, d_j;
 
@@ -721,7 +882,9 @@ int main() {
     S s{new double[3]{5, 6, 7}}, _d_s{new double[3]{0}};
     auto dfn9 = clad::gradient(fn9);
     dfn9.execute(s, &_d_s);
-    printf("{%.2f, %.2f, %.2f}\n", _d_s.a[0], _d_s.a[1], _d_s.a[2]);   // CHECK-EXEC: {0.00, 0.00, 1.00}
+    printf("{%.2f, %.2f, %.2f}\n", _d_s.a[0], _d_s.a[1], _d_s.a[2]);
+    delete[] s.a;
+    delete[] _d_s.a;   // CHECK-EXEC: {0.00, 0.00, 1.00}
 
     INIT_GRADIENT(fn10);
     TEST_GRADIENT(fn10, /*numOfDerivativeArgs=*/2, 7, 2, &d_i, &d_j);    // CHECK-EXEC: {1.00, 1.00}
@@ -734,4 +897,19 @@ int main() {
 
     INIT_GRADIENT(fn13);
     TEST_GRADIENT(fn13, /*numOfDerivativeArgs=*/2, 7, 2, &d_i, &d_j);    // CHECK-EXEC: {1.00, 4.00}
+
+    INIT_GRADIENT(fn14);
+    TEST_GRADIENT(fn14, /*numOfDerivativeArgs=*/2, 3, 4, &d_i, &d_j);    // CHECK-EXEC: {1.00, 0.00}
+
+    INIT_GRADIENT(fn15);
+    TEST_GRADIENT(fn15, /*numOfDerivativeArgs=*/2, 3, 4, &d_i, &d_j);    // CHECK-EXEC: {4.00, 3.00}
+
+    INIT_GRADIENT(fn16);
+    TEST_GRADIENT(fn16, /*numOfDerivativeArgs=*/2, 3, 4, &d_i, &d_j);    // CHECK-EXEC: {12.00, 9.00}
+
+    // Not run: clad drops the delete of a member, so both buffers would leak.
+    INIT_GRADIENT(fn17);
+
+    INIT_GRADIENT(fn18);
+    TEST_GRADIENT(fn18, /*numOfDerivativeArgs=*/2, 3, 4, &d_i, &d_j);    // CHECK-EXEC: {5.50, 3.00}
 }

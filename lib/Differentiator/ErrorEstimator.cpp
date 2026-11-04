@@ -359,9 +359,16 @@ void ErrorEstimationHandler::ActAfterProcessingArraySubscriptExpr(
       // to update `var_size` to the biggest index used if necessary.
       Expr* size = getSizeExpr(VD);
       Expr* idx = m_RMV->Clone(ASE->getIdx());
-      idx =
-          m_RMV->m_Sema.ImpCastExprToType(idx, size->getType(), CK_IntegralCast)
-              .get();
+      // Cast explicitly: std::max takes one type, and the derivative read back
+      // as source has to say which.
+      if (!m_RMV->m_Context.hasSameUnqualifiedType(idx->getType(),
+                                                   size->getType()))
+        idx = m_RMV->m_Sema
+                  .BuildCXXNamedCast(SourceLocation(), tok::kw_static_cast,
+                                     m_RMV->m_Context.getTrivialTypeSourceInfo(
+                                         size->getType().getUnqualifiedType()),
+                                     idx, SourceRange(), SourceRange())
+                  .get();
       llvm::SmallVector<clang::Expr*, 2> args{size, idx};
       Expr* extendedSize = m_RMV->GetFunctionCall("max", "std", args);
       size = m_RMV->Clone(size);
@@ -423,7 +430,7 @@ void ErrorEstimationHandler::ActBeforeFinalizingVisitReturnStmt(
 }
 
 void ErrorEstimationHandler::ActBeforeFinalizingPostIncDecOp(StmtDiff& diff) {
-  EmitUnaryOpErrorStmts(diff, m_RMV->isInsideLoop);
+  EmitUnaryOpErrorStmts(diff, m_RMV->isInsideLoop());
 }
 
 // FIXME: Issue a warning that error estimation may produce incorrect result if
@@ -503,8 +510,7 @@ void ErrorEstimationHandler::LookupCustomErrorFunction() {
     // namespace specifier. Here, we rebuild manually.
     CXXScopeSpec SS;
     SS.Extend(C, cladNS, noLoc, noLoc);
-    m_CustomErrorFunction =
-        S.BuildDeclarationNameExpr(SS, R, /*ADL=*/false).get();
+    m_CustomErrorFunction = utils::BuildDeclarationNameExpr(S, SS, R);
     return;
   }
 
@@ -562,7 +568,7 @@ void ErrorEstimationHandler::ActBeforeFinalizingVisitDeclStmt(
   for (size_t i = 0; i < decls.size(); i++) {
     DeclDiff<VarDecl> VDDiff(cast<VarDecl>(decls[0]),
                              cast<VarDecl>(declsDiff[0]));
-    EmitDeclErrorStmts(VDDiff, m_RMV->isInsideLoop);
+    EmitDeclErrorStmts(VDDiff, m_RMV->isInsideLoop());
   }
 }
 } // namespace clad

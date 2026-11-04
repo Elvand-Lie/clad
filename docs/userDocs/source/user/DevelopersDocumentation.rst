@@ -1,5 +1,5 @@
-Developers Documentation
-***************************
+Developer guide
+***************
 
 Building from source
 =======================
@@ -20,7 +20,7 @@ Linux (Ubuntu)
 Instructions to build documentation
 -------------------------------------
 
-Make sure you have installed `sphinx` before building clad with documentation.
+Make sure you have installed `sphinx` before building Clad with documentation.
 
 Please use the project's `requirements.txt` file to install Python dependencies.
 This will also install the correct version of `sphinx` : 
@@ -36,7 +36,7 @@ Doxygen Installation `Instructions`_.
 .. _Instructions : https://www.doxygen.nl/download.html
 
 
-To build clad and its documentation, use the following CMake command:
+To build Clad and its documentation, use the following CMake command:
 
 .. code-block:: bash
 
@@ -157,6 +157,10 @@ temporarily the differences in the produced outputs with:
 
    cmake --build . --target check-clad-execonly
 
+
+Reading the code Clad generated is something users do as much as contributors,
+so the switches for it are in the user guide, under
+:ref:`Debug functionalities <debug-functionalities>`.
 
 Debugging Clang
 ==================
@@ -293,6 +297,8 @@ Github runner.
 .. figure:: ../_static/setup-tmate-session.png
    :width: 850px
    :align: center
+   :alt: The expanded "setup tmate session" step in a GitHub Actions log,
+         showing the ssh command to copy.
 
 Now, to ssh into the GitHub runner do, simply do::
 
@@ -357,7 +363,7 @@ When in the container the neccessary tools can be installed with:
 
    apk add llvm llvm-dev llvm-gtest llvm-static clang clang-dev clang-static make cmake git
 
-Then clad can be built:
+Then Clad can be built:
 
 .. code-block:: sh
 

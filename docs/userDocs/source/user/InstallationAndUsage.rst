@@ -1,9 +1,9 @@
-Clad Installation
-******************
+Installation and usage
+**********************
 
 This page covers both installation and usage details for Clad.
 
-At the moment, LLVM/Clang 11.0.x - 21.0.x are supported.
+At the moment, LLVM/Clang 14.0.x - 23.2.x are supported.
 
 Conda Installation
 ====================
@@ -95,7 +95,8 @@ To compile using Clang < 20 , for example with clang-19, use:
 
    clang-19 -I /full/path/to/include/  -x c++ -std=c++17 -fplugin=/full/path/to/lib/clad.so SourceFile.cpp -o sourcefile -lstdc++ -lm
 
-To save the Clad generated derivative code to `Derivatives.cpp` add:
+To save the Clad generated derivative code to `Derivatives.cpp` (or to a file of
+your choosing with ``-fgenerate-source-file=<file>``) add:
 
 .. code-block:: bash
 
@@ -107,5 +108,6 @@ To print the Clad generated derivative add:
 
    -Xclang -plugin-arg-clad -Xclang -fdump-derived-fn
 
+Every option clad takes is listed in :doc:`Options`.
 
 Note: Clad does not work with the Apple releases of Clang

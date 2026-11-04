@@ -3,6 +3,7 @@
 #include "clad/Differentiator/CladUtils.h"
 
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclCXX.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/OperationKinds.h"
@@ -38,11 +39,19 @@ void AnalysisBase::addVar(const clang::VarDecl* VD, bool forceInit) {
   if (utils::IsAutoOrAutoPtrType(varType))
     varType = VD->getInit()->getType();
 
+  // A T&& bound to an xvalue, as std::move(x) is, refers to x as a T& would;
+  // only one bound to a prvalue owns what it refers to.
+  const Expr* init = VD->getInit();
+  if (varType->isRValueReferenceType() && !isa<ParmVarDecl>(VD) && init &&
+      !init->IgnoreImplicit()->isPRValue())
+    varType = VD->getASTContext().getLValueReferenceType(
+        varType.getNonReferenceType());
+
   curBranch[VD] = VarData(varType, forceInit);
 }
 
 // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)
-VarData::VarData(QualType QT, bool forceInit) {
+VarData::VarData(clang::QualType QT, bool forceInit) {
   QT = QT.getCanonicalType();
   if ((forceInit && QT->isLValueReferenceType()) || QT->isRValueReferenceType())
     QT = QT->getPointeeType();
@@ -65,7 +74,17 @@ VarData::VarData(QualType QT, bool forceInit) {
     utils::getRecordDeclFields(recordDecl, Fields);
     for (const auto* field : Fields) {
       const auto varType = field->getType();
-      (*newArrMap)[getProfileID(field)] = VarData(varType);
+      if (varType->isLValueReferenceType()) {
+        // A reference field is never rebound by the analysis -- constructor
+        // bodies are not modeled -- so a REF_TYPE's dependency set would stay
+        // empty and drop every bit setIsRequired stores. Keep one bit on the
+        // field itself: whether what it refers to is required.
+        VarData& fieldData = (*newArrMap)[getProfileID(field)];
+        fieldData.m_Type = VarData::FUND_TYPE;
+        fieldData.m_Val.m_FundData = false;
+      } else {
+        (*newArrMap)[getProfileID(field)] = VarData(varType);
+      }
     }
   }
 }
@@ -172,7 +191,7 @@ bool AnalysisBase::getIDSequence(const clang::Expr* E, const VarDecl*& VD,
       if (!VD)
         return false;
       QualType VDType = VD->getType();
-      if (VDType->isLValueReferenceType() || VDType->isPointerType()) {
+      if (VDType->isReferenceType() || VDType->isPointerType()) {
         VarData* refData = getVarDataFromDecl(VD);
         // Globals and other untracked declarations have no VarData.
         if (!refData) {
@@ -182,11 +201,12 @@ bool AnalysisBase::getIDSequence(const clang::Expr* E, const VarDecl*& VD,
         }
         if (refData->m_Type == VarData::REF_TYPE) {
           std::set<const VarDecl*>& vars = *refData->m_Val.m_RefData;
-          if (vars.size() == 1) {
+          // A null target is `this`, which only a method has: elsewhere what
+          // the reference reaches is not known.
+          const auto* MD = dyn_cast_or_null<CXXMethodDecl>(m_Function);
+          if (vars.size() == 1 && (*vars.begin() || MD)) {
             VD = *vars.begin();
-            QualType VDType =
-                VD ? VD->getType()
-                   : cast<CXXMethodDecl>(m_Function)->getThisType();
+            QualType VDType = VD ? VD->getType() : MD->getThisType();
             if (utils::isSameCanonicalType(VDType, E->getType()))
               break;
           }
@@ -236,13 +256,17 @@ bool AnalysisBase::findReq(const VarData& varData) {
   return false;
 }
 
-bool AnalysisBase::findReq(const Expr* E) {
+bool AnalysisBase::findReq(const clang::Expr* E) {
   llvm::SmallVector<ProfileID, 2> IDSequence;
   const VarDecl* VD = nullptr;
   if (getIDSequence(E, VD, IDSequence)) {
     VarData* data = getVarDataFromDecl(VD);
-    for (ProfileID& id : IDSequence)
+    for (ProfileID& id : IDSequence) {
+      if (data->m_Type != VarData::ARR_TYPE &&
+          data->m_Type != VarData::OBJ_TYPE)
+        break;
       data = (*data)[id];
+    }
     return findReq(*data);
   }
 
@@ -277,7 +301,7 @@ bool AnalysisBase::merge(VarData& targetData, VarData& mergeData) {
     for (auto& pair : *mergeData.m_Val.m_ArrData) {
       auto it = targetData.m_Val.m_ArrData->find(pair.first);
       if (it == targetData.m_Val.m_ArrData->end())
-        (*targetData.m_Val.m_ArrData)[pair.first] = pair.second.copy();
+        isMod = merge(*targetData[pair.first], pair.second) || isMod;
     }
     return isMod;
   }
@@ -445,8 +469,10 @@ bool AnalysisBase::merge(VarsData* targetData, VarsData* mergeData) {
     if (found) {
       if (merge(*found, *pair.second))
         isModified = true;
-    } else
+    } else {
       (*targetData)[pair.first] = pair.second->copy();
+      isModified = true;
+    }
   }
 
   // For every variable in collected targetData predecessors, search it inside
@@ -464,8 +490,10 @@ bool AnalysisBase::merge(VarsData* targetData, VarsData* mergeData) {
         while (branch) {
           auto it = branch->find(pair.first);
           if (it != branch->end()) {
-            (*targetData)[pair.first] = pair.second->copy();
-            merge((*targetData)[pair.first], it->second);
+            if (targetData->find(pair.first) == targetData->end())
+              (*targetData)[pair.first] = pair.second->copy();
+            isModified =
+                merge((*targetData)[pair.first], it->second) || isModified;
             break;
           }
           branch = branch->m_Prev;

@@ -7,7 +7,13 @@
 #include "clad/Differentiator/DerivativeBuilder.h"
 
 #include "ASTIntegrity.h"
+#include "Analyses.h"
+#include "Diagnostics.h"
+#include "GeneratedCode.h"
 #include "JacobianModeVisitor.h"
+#include "LoopAnalyzer.h"
+
+#include "clang/Basic/SourceLocation.h"
 
 #include "clad/Differentiator/BaseForwardModeVisitor.h"
 #include "clad/Differentiator/CladUtils.h"
@@ -34,6 +40,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/OperationKinds.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/TemplateBase.h"
 #include "clang/AST/Type.h"
 #include "clang/Analysis/AnalysisDeclContext.h"
@@ -41,7 +48,6 @@
 #include "clang/Basic/Specifiers.h"
 #include "clang/Basic/TokenKinds.h"
 #include "clang/Sema/Lookup.h"
-#include "clang/Sema/Overload.h"
 #include "clang/Sema/Scope.h"
 #include "clang/Sema/Sema.h"
 #include "clang/Sema/SemaInternal.h"
@@ -60,12 +66,20 @@ namespace clad {
 
 DerivativeBuilder::DerivativeBuilder(clang::Sema& S, plugin::CladPlugin& P,
                                      DiffScheduler& Scheduler)
-    : m_Sema(S), m_CladPlugin(P), m_Context(S.getASTContext()),
-      m_Scheduler(Scheduler),
+    : m_Sema(S), m_GeneratedCode(std::make_unique<GeneratedCode>(S)),
+      m_CladPlugin(P), m_Context(S.getASTContext()), m_Scheduler(Scheduler),
       m_NodeCloner(new utils::StmtClone(m_Sema, m_Context)),
       m_BuiltinDerivativesNSD(nullptr), m_NumericalDiffNSD(nullptr) {}
 
 DerivativeBuilder::~DerivativeBuilder() {}
+
+SourceLocation DerivativeBuilder::GenLoc() {
+  return m_GeneratedCode->nextLoc();
+}
+
+GeneratedCode& DerivativeBuilder::getGeneratedCode() {
+  return *m_GeneratedCode;
+}
 
 static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
   DeclContext* DC = D->getLexicalDeclContext();
@@ -77,7 +91,9 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
     // should follow closer what clang does, namely building a
     // FunctionTemplateDecl and then we should instantiate it with the
     // particular template parameters.
-    if (R.Function && !R.Function->getPrimaryTemplate())
+    if (R.DerivedFDPrototypes.size() >= R.CurrentDerivativeOrder)
+      Previous.addDecl(R.DerivedFDPrototypes[R.CurrentDerivativeOrder - 1]);
+    else if (R.Function && !R.Function->getPrimaryTemplate())
       S.LookupQualifiedName(Previous, dFD->getParent());
 
     // Derivatives are declared inline, but a hand-written custom derivative may
@@ -89,6 +105,17 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
     };
     if (std::any_of(Previous.begin(), Previous.end(), definedNotInline))
       dFD->setInlineSpecified(false);
+
+    // Inline fits a derivative clad calls but never names outside: a unit that
+    // does not call one should not emit it. The root of the request graph is
+    // the one name that leaves clad, and an interpreter reaches it from a
+    // later translation unit, where a discardable definition is emitted again
+    // along with every derivative it calls. Let the root follow the primal,
+    // which is what decides whether naming it twice is a redefinition at all.
+    if (R.CallUpdateRequired && R.Function) {
+      dFD->setInlineSpecified(R.Function->isInlineSpecified());
+      dFD->setImplicitlyInline(R.Function->isInlined());
+    }
 
     // Check if we created a top-level decl with the same name for another
     // class.
@@ -174,6 +201,13 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
         // We only need the keywords final and override in the tag declaration.
         if (isa<OverrideAttr>(Attr) || isa<FinalAttr>(Attr))
           continue;
+        // These describe the primal's result, not the derivative's. Clad emits
+        // a pullback call as a statement and drops one whose result Sema
+        // calls unused, as for [[nodiscard]]; and a pure or const pullback
+        // could be dropped by the optimizer, though it writes its adjoints.
+        if (isa<WarnUnusedResultAttr>(Attr) || isa<PureAttr>(Attr) ||
+            isa<ConstAttr>(Attr))
+          continue;
         if (!hasAttribute(returnedFD, Attr->getKind()))
           returnedFD->addAttr(Attr->clone(m_Context));
       }
@@ -212,22 +246,8 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
       if (!find.HasFormOfMemberPointer) {
         OverloadExpr* ovl = find.Expression;
 
-        if (isa<UnresolvedLookupExpr>(ovl)) {
-          ExprResult result;
-          SourceLocation Loc;
-          OverloadCandidateSet CandidateSet(Loc,
-                                            OverloadCandidateSet::CSK_Normal);
-          Scope* S = m_Sema.getScopeForContext(m_Sema.CurContext);
-          auto* ULE = cast<UnresolvedLookupExpr>(ovl);
-          // Populate CandidateSet.
-          m_Sema.buildOverloadedCallSet(S, UnresolvedLookup, ULE, ARargs, Loc,
-                                        &CandidateSet, &result);
-          OverloadCandidateSet::iterator Best = nullptr;
-          OverloadingResult OverloadResult = CandidateSet.BestViableFunction(
-              m_Sema, UnresolvedLookup->getBeginLoc(), Best);
-          if (OverloadResult != 0U) // No overloads were found.
-            return true;
-        }
+        if (isa<UnresolvedLookupExpr>(ovl))
+          return !utils::ResolveOverload(m_Sema, UnresolvedLookup, ARargs);
       }
       return false;
     }
@@ -235,9 +255,17 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
     if (!isa<DeclRefExpr>(UnresolvedLookup))
       return false;
 
-    const auto* DRE = cast<DeclRefExpr>(UnresolvedLookup);
-    if (const auto* FD = dyn_cast<FunctionDecl>(DRE->getDecl()))
-      return NeedsMoreArgs(FD, ARargs.size());
+    auto* DRE = cast<DeclRefExpr>(UnresolvedLookup);
+    if (auto* FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
+      if (NeedsMoreArgs(FD, ARargs.size()))
+        return true;
+      // With a single candidate Sema builds a plain reference and never
+      // reconsiders it. It can be the wrong function: two instantiations of
+      // one template ask for the same derivative name, so the second lookup
+      // finds the first's derivative. Calling it makes the mismatch a hard
+      // error instead of a signal to derive the overload that fits.
+      return !utils::ResolveOverload(m_Sema, UnresolvedLookup, ARargs);
+    }
 
     return false;
   }
@@ -249,7 +277,7 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
 
     IdentifierInfo* II = &m_Context.Idents.get(Name);
     DeclarationName name(II);
-    DeclarationNameInfo DNInfo(name, utils::GetValidSLoc(m_Sema));
+    DeclarationNameInfo DNInfo(name, GenLoc());
     LookupResult R(m_Sema, DNInfo, Sema::LookupOrdinaryName);
 
     NamespaceDecl* NSD = nullptr;
@@ -305,7 +333,8 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
       const std::string& Name, llvm::SmallVectorImpl<Expr*>& CallArgs,
       clang::Scope* S, const clang::Expr* callSite,
       bool forCustomDerv /*=true*/, bool namespaceShouldExist /*=true*/,
-      Expr* CUDAExecConfig /*=nullptr*/) {
+      Expr* CUDAExecConfig /*=nullptr*/,
+      const TemplateArgumentListInfo* TemplateArgs /*=nullptr*/) {
     DeclContext* originalFnDC = nullptr;
 
     // FIXME: callSite must not be null but it comes when we try to build
@@ -318,8 +347,8 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
       } else if (const auto* CE = dyn_cast<CallExpr>(callSite)) {
         const Expr* Callee = CE->getCallee()->IgnoreParenCasts();
         if (const auto* DRE = dyn_cast<DeclRefExpr>(Callee))
-          originalFnDC =
-              const_cast<DeclContext*>(DRE->getFoundDecl()->getDeclContext());
+          originalFnDC = const_cast<DeclContext*>(
+              utils::GetCustomDerivativeLookupContext(DRE->getFoundDecl()));
         else if (const auto* MemberE = dyn_cast<MemberExpr>(Callee))
           originalFnDC = MemberE->getFoundDecl().getDecl()->getDeclContext();
       } else if (const auto* CtorExpr = dyn_cast<CXXConstructExpr>(callSite)) {
@@ -360,6 +389,7 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
           UnqualifiedId Member;
           Member.setIdentifier(&m_Context.Idents.get(Name), Loc);
           bool isArrow = Base->getType()->isPointerType();
+          Base = utils::ParenthesizeMemberBase(m_Sema, Base);
           // FIXME: update SS here?
           auto* ME =
               m_Sema
@@ -378,8 +408,8 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
               .get();
         }
       }
-      Expr* UnresolvedLookup =
-          m_Sema.BuildDeclarationNameExpr(SS, R, /*ADL*/ false).get();
+      Expr* UnresolvedLookup = utils::BuildDeclarationNameExpr(
+          m_Sema, SS, R, /*ADL=*/false, TemplateArgs);
 
       if (noOverloadExists(UnresolvedLookup, MARargs))
         return nullptr;
@@ -450,35 +480,18 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
     return derivative;
   }
 
-  void
-  DerivativeBuilder::diagnoseUndefinedFunction(const clang::FunctionDecl* FD,
-                                               SourceLocation srcLoc,
-                                               bool numDiffViable) {
-    bool NumDiffEnabled =
-        !m_Sema.getPreprocessor().isMacroDefined("CLAD_NO_NUM_DIFF");
-    diag(DiagnosticsEngine::Warning, srcLoc,
-         "attempted differentiation of function %0 without definition "
-         "and no suitable overload was found in "
-         "namespace 'custom_derivatives'")
+  void DerivativeBuilder::diagnoseUndefinedFunction(const FunctionDecl* FD,
+                                                    SourceLocation srcLoc,
+                                                    bool numDiffViable,
+                                                    bool numDiffEnabled) {
+    utils::diag(m_Sema, CladDiag::warn_undefined_function, srcLoc)
         << FD << srcLoc;
-    if (!numDiffViable) {
-      diag(
-          DiagnosticsEngine::Note, srcLoc,
-          "numerical differentiation is not viable for %0; considering %0 as 0")
-          << FD << srcLoc;
-    } else if (NumDiffEnabled) {
-      diag(DiagnosticsEngine::Note, srcLoc,
-           "falling back to numerical differentiation for %0 since no "
-           "suitable overload was found and clad could not derive it; "
-           "to disable this feature, compile your programs with "
-           "-DCLAD_NO_NUM_DIFF")
-          << FD << srcLoc;
-    } else {
-      diag(DiagnosticsEngine::Note, srcLoc,
-           "fallback to numerical differentiation is disabled by the "
-           "'CLAD_NO_NUM_DIFF' macro; considering %0 as 0")
-          << FD << srcLoc;
-    }
+    CladDiag Note = CladDiag::note_numdiff_off;
+    if (!numDiffViable)
+      Note = CladDiag::note_numdiff_not_viable;
+    else if (numDiffEnabled)
+      Note = CladDiag::note_numdiff_fallback;
+    utils::diag(m_Sema, Note, srcLoc) << FD << srcLoc;
   }
 
   void DerivativeBuilder::EmitPortingHint(const DiffRequest& request) {
@@ -545,13 +558,17 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
       diag(DiagnosticsEngine::Note, Loc,
            "or, if its reverse-forward pass is a no-op (e.g. a shallow copy "
            "that shares its adjoint), declare %0 with signature %1 and mark it "
-           "elidable_reverse_forw")
+           "CLAD_ELIDABLE_REVERSE_FORW")
           << request.ComputeDerivativeName() << DerivativeType;
   }
 
   DerivativeAndOverload
   DerivativeBuilder::Derive(const DiffRequest& request) {
     TimedGenerationRegion G([&request]() { return (std::string)request; });
+    // A request derived while building this one keeps its own account.
+    llvm::SaveAndRestore<bool> SaveReachedFallback(m_ReachedFallback, false);
+    GeneratedCodeDiagnostics HoldDiags(*m_GeneratedCode,
+                                       m_Sema.getDiagnostics(), request);
     EmitPortingHint(request);
     if (const FunctionDecl* FD = request.Function) {
       // Process the custom derivative
@@ -585,15 +602,20 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
           // Build ``nullptr``
           Expr* dummy = utils::getZeroInit(ptrType, m_Sema);
           // Build ``*nullptr``
-          dummy = m_Sema.BuildUnaryOp(nullptr, {}, UO_Deref, dummy).get();
-          SourceLocation fakeLoc = utils::GetValidSLoc(m_Sema);
+          // A real location: converting the argument to a class-typed
+          // parameter may instantiate the class there for the first time,
+          // and an invalid point of instantiation trips clang's assertions.
+          SourceLocation DummyLoc = GenLoc();
+          dummy =
+              m_Sema.BuildUnaryOp(nullptr, DummyLoc, UO_Deref, dummy).get();
           // Build ``static_cast<parTy>(*nullptr)``
           dummy =
               m_Sema
                   .BuildCStyleCastExpr(
-                      fakeLoc,
-                      m_Sema.getASTContext().getTrivialTypeSourceInfo(parTy),
-                      fakeLoc, dummy)
+                      GenLoc(),
+                      m_Sema.getASTContext().getTrivialTypeSourceInfo(
+                          parTy, DummyLoc),
+                      GenLoc(), dummy)
                   .get();
           Inits.push_back(dummy);
         }
@@ -631,7 +653,11 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
         if (!request.DeclarationOnly ||
             !(m_Scheduler.getDerivedFns().IsCladDerivative(FD) ||
               m_Scheduler.getDerivedFns().IsCustomDerivative(FD))) {
-          const auto& name = FD->getName();
+          // getName() asserts on a non-identifier name; an operator FD (e.g. a
+          // lambda's operator()) reaches here with one, and matches none of the
+          // simple-identifier special cases below.
+          StringRef name =
+              FD->getDeclName().isIdentifier() ? FD->getName() : StringRef();
           // FIXME: Currently, these functions cannot be covered with custom
           // derivatives because templates are not well-supported in custom
           // derivatives. We have to use workarounds to support them.
@@ -641,7 +667,12 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
             if (request.CallContext)
               L = request.CallContext->getBeginLoc();
             diagnoseUndefinedFunction(
-                FD, L, /*numDiffViable=*/utils::IsRealFunction(FD));
+                FD, L,
+                /*numDiffViable=*/
+                // One request serves every call to FD, so this asks about FD;
+                // a call passing more than its parameters is refused there.
+                utils::GetNumDiffTarget(m_Sema, FD, /*CE=*/nullptr) != nullptr,
+                /*numDiffEnabled=*/request.EnableNumericalDiffFallback);
           }
           return {};
         }
@@ -823,15 +854,130 @@ static void registerDerivative(Decl* D, Sema& S, const DiffRequest& R) {
       }
 #endif
 
+    // What an analysis looked for in the primal and did not find. Reported
+    // here rather than before, because some of them run as the visitor asks.
+    // Only for the requests whose sweep reads those facts: the reverse
+    // forward pass is the same body as its pullback, and would say it twice.
+    if (request.Mode == DiffMode::reverse || request.Mode == DiffMode::pullback)
+      emitAnalysisMissRemarks(request);
+
+    if (m_ReachedFallback)
+      if (const auto* Derivative =
+              dyn_cast_or_null<FunctionDecl>(result.derivative))
+        m_FallbackDependent.insert(Derivative);
+
     return result;
+  }
+
+  /// Whether \p R asked to hear from the analysis \p A.
+  static bool wantsRemark(const DiffRequest& R, AnalysisId A) {
+    switch (A) {
+#define CLAD_ANALYSIS(Id, Name, Legacy, Default, FirstBit, Desc)             \
+    case AnalysisId::Id:                                                       \
+      return R.Remark##Id##Analysis;
+#include "clad/Differentiator/Analyses.def"
+    }
+    llvm_unreachable("unhandled analysis"); // LCOV_EXCL_LINE
+  }
+
+  void DerivativeBuilder::emitAnalysisMissRemarks(const DiffRequest& R) {
+    const clang::FunctionDecl* FD = R.Function;
+    if (!FD)
+      return;
+    clang::Sema& S = m_Sema;
+
+    /// What in the code stopped the analysis, and what to write instead.
+    /// Where the analysis did not run there is no miss to report, and
+    /// naming one would be false: name the switch that turned it off.
+    auto explain = [&](AnalysisId A, AnalysisMiss M, clang::SourceLocation At,
+                       clang::SourceLocation Fallback) {
+      if (M == AnalysisMiss::None) {
+        utils::diag(S, CladDiag::note_analysis_off, Fallback) << nameOf(A);
+        return;
+      }
+      AnalysisDesc Desc = descOf(M);
+      utils::diag(S, CladDiag::note_construct_miss,
+                  At.isValid() ? At : Fallback)
+          << detailOf(M);
+      utils::diag(S, CladDiag::note_construct_fix, Fallback)
+          << nameOf(Desc) << codeOf(Desc);
+    };
+
+    // What an analysis without a result of its own filed as it ran.
+    for (const AnalysisMissRecord& M : R.getAnalysisMisses()) {
+      AnalysisDesc Desc = descOf(M.Why);
+      AnalysisId A = analysisOf(Desc);
+      if (!wantsRemark(R, A))
+        continue;
+      utils::diag(S, CladDiag::remark_construct_cost, M.At) << costOf(Desc);
+      explain(A, M.Why, M.At, M.At);
+    }
+
+    if (!R.RemarkLoopAnalysis || !FD->doesThisDeclarationHaveABody())
+      return;
+
+    struct ForStmtFinder : public RecursiveASTVisitor<ForStmtFinder> {
+      llvm::SmallVector<const clang::ForStmt*, 8> Loops;
+      bool VisitForStmt(clang::ForStmt* FS) {
+        Loops.push_back(FS);
+        return true;
+      }
+    } Finder;
+    Finder.TraverseStmt(FD->getBody());
+    for (const clang::ForStmt* FS : Finder.Loops) {
+      const LoopFacts& F = R.getLoopFacts(FS);
+      if (F && F.BoundsAreStable)
+        continue;
+      utils::diag(S, CladDiag::remark_construct_cost, FS->getForLoc())
+          << costOf(AnalysisDesc::CountedLoop);
+      explain(AnalysisId::Loop, F.Why, F.MissedAt, FS->getForLoc());
+    }
+    for (const clang::ForStmt* FS : Finder.Loops) {
+      const LoopFacts& F = R.getLoopFacts(FS);
+      if (!F || !F.BoundsAreStable || F.Count >= 0)
+        continue;
+      utils::diag(S, CladDiag::remark_construct_cost, FS->getForLoc())
+          << costOf(AnalysisDesc::ArrayRecord);
+      explain(AnalysisId::Loop, F.ArrayWhy, F.ArrayMissedAt, FS->getForLoc());
+    }
+
+    llvm::ArrayRef<WrittenExtent> Extents = R.getWrittenExtents();
+    for (unsigned i = 0, e = Extents.size(); i != e; ++i) {
+      const WrittenExtent& W = Extents[i];
+      if (W.isProven())
+        continue;
+      clang::SourceLocation Loc =
+          W.RefusedAt.isValid() ? W.RefusedAt : FD->getLocation();
+      utils::diag(S, CladDiag::remark_construct_cost_for, Loc)
+          << FD->getParamDecl(i)->getNameAsString()
+          << costOf(AnalysisDesc::BoundedWrite);
+      explain(AnalysisId::Loop, W.Why, W.RefusedAt, Loc);
+    }
   }
 
   FunctionDecl*
   DerivativeBuilder::FindDerivedFunction(const DiffRequest& request) {
     auto DFI = m_Scheduler.getDerivedFns().Find(request);
-    if (DFI.IsValid())
-      return DFI.DerivedFn();
-    return nullptr;
+    if (!DFI.IsValid())
+      return nullptr;
+    diagnoseFallbackConflict(request, DFI);
+    return DFI.DerivedFn();
+  }
+
+  void DerivativeBuilder::diagnoseFallbackConflict(const DiffRequest& request,
+                                                   const DerivedFnInfo& DFI) {
+    // A derivative that never reached a fallback is the same either way.
+    if (!m_FallbackDependent.contains(DFI.DerivedFn()))
+      return;
+    bool Taken = false;
+    const char* Flag = DFI.DisagreeingFallback(request, Taken);
+    if (!Flag)
+      return;
+    SourceLocation Loc;
+    if (request.CallContext)
+      Loc = request.CallContext->getBeginLoc();
+    utils::diag(m_Sema, CladDiag::err_fallback_conflict, Loc)
+        << request.Function << Flag << Taken;
   }
 
   void DerivativeBuilder::AddEdgeToGraph(const DiffRequest& request,

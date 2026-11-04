@@ -12,6 +12,7 @@
 namespace clad {
 /// A visitor for processing the function code in vector forward mode.
 /// Used to compute derivatives by clad::vector_forward_differentiate.
+/// \ingroup visitors
 class VectorForwardModeVisitor : public BaseForwardModeVisitor {
 protected:
   /// Tracks where the next independent variable starts in the flat vector of
@@ -96,6 +97,16 @@ public:
   StmtDiff
   VisitArraySubscriptExpr(const clang::ArraySubscriptExpr* ASE) override;
   StmtDiff VisitReturnStmt(const clang::ReturnStmt* RS) override;
+  void matchBranchTangents(StmtDiff& TrueDiff, StmtDiff& FalseDiff,
+                           clang::QualType T) override;
+  clang::Expr* castTangent(clang::Expr* Dx,
+                           const clang::CastExpr* Cast) override;
+  /// \p Dx as the vector of tangents it initializes: a constant zero, which
+  /// would size the vector rather than fill it, becomes a vector of zeros of
+  /// \p T; anything else is left as it is.
+  clang::Expr* asTangentVector(clang::Expr* Dx, clang::QualType T);
+  /// \p Value, after evaluating \p E for what it changes.
+  clang::Expr* keepEffects(clang::Expr* E, clang::Expr* Value);
   // Decl is not Stmt, so it cannot be visited directly.
   DeclDiff<clang::VarDecl>
   DifferentiateVarDecl(const clang::VarDecl* VD) override;

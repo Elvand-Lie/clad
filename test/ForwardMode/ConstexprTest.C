@@ -1,6 +1,6 @@
 // RUN: %cladclang %s -I%S/../../include -std=c++23 -oConstexprTest.out | %filecheck %s
 // RUN: ./ConstexprTest.out | %filecheck_exec %s
-// UNSUPPORTED: clang-11, clang-12, clang-13, clang-14, clang-15, clang-16
+// UNSUPPORTED: clang-14, clang-15, clang-16
 
 #include "clad/Differentiator/Differentiator.h"
 
@@ -33,7 +33,7 @@ constexpr double mul(double a, double b, double c) {
 
 constexpr double fn_test() {
     if consteval {
-	auto dx = clad::differentiate<clad::immediate_mode>(fn, "x");
+	auto dx = clad::differentiate(fn, "x");
 
 	return dx.execute(4, 7);
     } else {
@@ -44,7 +44,7 @@ constexpr double fn_test() {
 
 constexpr double mul_test() {
     if consteval {
-	auto dx = clad::differentiate<clad::immediate_mode>(mul, "a");
+	auto dx = clad::differentiate(mul, "a");
 
 	return dx.execute(5, 6, 10);
     } else {

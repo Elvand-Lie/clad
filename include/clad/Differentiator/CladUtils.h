@@ -10,15 +10,20 @@
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclarationName.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/ExprCXX.h"
 #include "clang/AST/Type.h"
 #include "clang/Analysis/AnalysisDeclContext.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Sema/Ownership.h"
 #include "clang/Sema/Sema.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <set>
 #include <string>
 
 namespace clang {
@@ -28,42 +33,56 @@ namespace clang {
 }
 
 namespace clad {
-  namespace utils {
-    /// If `FD` is an overloaded operator, returns a name, unique for
-    /// each operator, that can be used to create valid C++ identifiers.
-    /// Otherwise if `FD` is an ordinary function, returns the name of the
-    /// function `FD`.
-    std::string ComputeEffectiveFnName(const clang::FunctionDecl* FD);
+/// A message clad emits; see Diagnostics.h, which the sites that name one
+/// include. Named here so that every reader of this header does not have to
+/// read the list.
+enum class CladDiag : std::uint16_t;
+namespace utils {
+/// If `FD` is an overloaded operator, returns a name, unique for
+/// each operator, that can be used to create valid C++ identifiers.
+/// Otherwise if `FD` is an ordinary function, returns the name of the
+/// function `FD`.
+std::string ComputeEffectiveFnName(const clang::FunctionDecl* FD);
 
-    // Unwraps S to a single statement if it's a compound statement only
-    // containing 1 statement.
-    clang::Stmt* unwrapIfSingleStmt(clang::Stmt* S);
+// Unwraps S to a single statement if it's a compound statement only
+// containing 1 statement.
+clang::Stmt* unwrapIfSingleStmt(clang::Stmt* S);
 
-    /// Creates and returns a compound statement having statements as follows:
-    /// {`S`, all the statement of `initial` in sequence}
-    clang::CompoundStmt* PrependAndCreateCompoundStmt(clang::ASTContext& C,
-                                                      clang::Stmt* initial,
-                                                      clang::Stmt* S);
+/// Creates and returns a compound statement having statements as follows:
+/// {`S`, all the statement of `initial` in sequence}
+clang::CompoundStmt* PrependAndCreateCompoundStmt(clang::ASTContext& C,
+                                                  clang::Stmt* initial,
+                                                  clang::Stmt* S);
 
-    /// Creates and returns a compound statement having statements as follows:
-    /// {all the statements of `initial` in sequence, `S`}
-    clang::CompoundStmt* AppendAndCreateCompoundStmt(clang::ASTContext& C,
-                                                     clang::Stmt* initial,
-                                                     clang::Stmt* S);
+/// Creates and returns a compound statement having statements as follows:
+/// {all the statements of `initial` in sequence, `S`}
+clang::CompoundStmt* AppendAndCreateCompoundStmt(clang::ASTContext& C,
+                                                 clang::Stmt* initial,
+                                                 clang::Stmt* S);
 
-    template <std::size_t N>
-    clang::Sema::SemaDiagnosticBuilder
-    diag(clang::Sema& S, clang::DiagnosticsEngine::Level Level,
-         clang::SourceLocation Loc, const char (&Format)[N]) {
-      static_assert(N > 1, "Diagnostic format string must not be empty");
-      assert(!std::isupper(Format[0]) && "Diagnostics start with lower case!");
-      assert((std::isalpha(Format[N - 2]) || Format[N - 2] == ')' ||
-              Format[N - 2] == '\'' || std::isdigit(Format[N - 2])) &&
-             "Diagnostics end with no punctuation!");
-      unsigned DiagID = S.Diags.getCustomDiagID(Level, Format);
-      clang::Sema::SemaDiagnosticBuilder B = S.Diag(Loc, DiagID);
-      return B;
-    }
+/// Emits the message Analyses.td describes under this name, at its own
+/// severity. The placeholders are filled in by the caller, as with the
+/// literal form below.
+clang::Sema::SemaDiagnosticBuilder diag(clang::Sema& S, CladDiag D,
+                                        clang::SourceLocation Loc);
+
+template <std::size_t N>
+clang::Sema::SemaDiagnosticBuilder diag(
+    clang::Sema& S, clang::DiagnosticsEngine::Level Level,
+    clang::SourceLocation Loc,
+    // Bound to the literal itself, which is what lets the checks below read
+    // its length and its last character at compile time.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    const char (&Format)[N]) {
+  static_assert(N > 1, "Diagnostic format string must not be empty");
+  assert(!std::isupper(Format[0]) && "Diagnostics start with lower case!");
+  assert((std::isalpha(Format[N - 2]) || Format[N - 2] == ')' ||
+          Format[N - 2] == '\'' || std::isdigit(Format[N - 2])) &&
+         "Diagnostics end with no punctuation!");
+  unsigned DiagID = S.Diags.getCustomDiagID(Level, Format);
+  clang::Sema::SemaDiagnosticBuilder B = S.Diag(Loc, DiagID);
+  return B;
+}
 
     /// Creates nested name specifier associated with declaration context
     /// argument `DC`.
@@ -76,13 +95,15 @@ namespace clad {
     /// }
     ///
     /// Passing `SomeStruct` as declaration context will create
-    /// nested name specifier of the form `::A::B::struct SomeClass::` or
+    /// nested name specifier of the form `A::B::struct SomeClass::`, with a
+    /// leading pair of colons, or
     /// `A::B::struct SomeClass::` depending on if `addGlobalNS` is true or
     /// false in the `CXXScopeSpec` argument `CSS`.
     ///
     /// \note Currently only namespace and class/struct nested name specifiers
     /// are supported.
     ///
+    /// \param[in] semaRef the Sema to build the specifier with.
     /// \param[in] DC
     /// \param[out] CSS
     /// \param[in] addGlobalNS if true, then the global namespace specifier will
@@ -109,6 +130,11 @@ namespace clad {
     /// \returns  type with namespace specifier added.
     clang::QualType AddNamespaceSpecifier(clang::Sema& semaRef, clang::ASTContext& C, clang::QualType QT);
 
+    /// The context to look up the custom derivative of a call in: that of the
+    /// declaration the call found, or, for a block-scope using-declaration,
+    /// that of the declaration it names.
+    const clang::DeclContext*
+    GetCustomDerivativeLookupContext(const clang::Decl* Found);
     /// Finds declaration context associated with the DC1::DC2, but doesn't
     /// replicate the common part of the declaration contexts.
     /// For example, consider DC1 corresponds to the following declaration
@@ -148,7 +174,13 @@ namespace clad {
                                             clang::Sema& S,
                                             clang::DeclContext* DC = nullptr);
 
-    /// Finds namespace 'namespc` under the declaration context `DC` or the
+    /// Resolve a function lookup expression or a direct function reference.
+    /// Return null when no usable overload exists for the arguments.
+    clang::FunctionDecl*
+    ResolveOverload(clang::Sema& S, clang::Expr* lookup,
+                    llvm::MutableArrayRef<clang::Expr*> args);
+
+    /// Finds namespace `namespc` under the declaration context `DC` or the
     /// translation unit declaration if `DC` is null.
     ///
     /// \param S
@@ -170,6 +202,21 @@ namespace clad {
 
     /// Returns true if `QT` is Array or Pointer Type, otherwise returns false.
     bool isArrayOrPointerType(clang::QualType QT);
+
+    /// Returns true if A and B are the same parameter, otherwise returns false.
+    bool IsSameParam(const clang::ValueDecl* A, const clang::ValueDecl* B);
+
+    /// \returns whether a hessian of \p FD can be assembled from
+    /// hessian-vector products rather than derived once per direction.
+    ///
+    /// The vector-product wrapper hands the pushforward its tangents and the
+    /// pullback its adjoints by position, so it needs the generated shape of
+    /// one tangent per parameter and nothing else in between. An instance
+    /// method also carries `this` and its adjoint, which the hessian matrix
+    /// has no place for. Both the planner and the hessian visitor ask this,
+    /// so that the derivatives the planner schedules are the ones the visitor
+    /// goes looking for.
+    bool canUseHessianVectorProducts(const clang::FunctionDecl* FD);
 
     /// Returns true if `T` is auto or auto* type, otherwise returns false.
     bool IsAutoOrAutoPtrType(clang::QualType T);
@@ -199,8 +246,21 @@ namespace clad {
                                    const clang::LookupResult& Overloads);
 
     /// Returns true if the function has only real non-reference parameters and
-    /// returns a real number.
-    bool IsRealFunction(const clang::FunctionDecl* FD);
+    /// returns a real number. A variadic function counts unless the call \p CE
+    /// passes something past its parameters: numerical_diff, like a
+    /// pushforward, calls it through them, and would drop the rest. A null CE
+    /// asks about the function, for its declared parameters.
+    bool IsRealFunction(const clang::FunctionDecl* FD,
+                        const clang::CallExpr* CE);
+
+    /// The function the numerical-diff fallback passes as a pointer to
+    /// differentiate \p FD: FD itself, or, for a builtin whose address cannot
+    /// be taken, the library function it stands for (`exp` for
+    /// `__builtin_exp`). Null when there is none, or FD is not a real
+    /// function for the call \p CE (see IsRealFunction).
+    const clang::FunctionDecl* GetNumDiffTarget(clang::Sema& S,
+                                                const clang::FunctionDecl* FD,
+                                                const clang::CallExpr* CE);
 
     /// Returns true if `arg` is an argument passed by reference or is of
     /// pointer/array type.
@@ -227,6 +287,12 @@ namespace clad {
     /// `(E)`.
     clang::ParenExpr* BuildParenExpr(clang::Sema& semaRef, clang::Expr* E);
 
+    /// Returns `base` wrapped in a `ParenExpr` if it needs parentheses to be
+    /// printed as the base of a member access, e.g. `(*p).x`; otherwise
+    /// returns `base`.
+    clang::Expr* ParenthesizeMemberBase(clang::Sema& semaRef,
+                                        clang::Expr* base);
+
     /// Returns `IdentifierInfo` that represents the value in the `identifier`
     /// parameter.
     clang::IdentifierInfo* GetIdentifierInfo(clang::Sema& semaRef,
@@ -247,6 +313,19 @@ namespace clad {
                      clang::TypeSourceInfo* TSI = nullptr,
                      clang::SourceLocation Loc = clang::SourceLocation());
 
+    /// Attaches \p params to \p FD and tells each one where it sits.
+    ///
+    /// A hand-built ParmVarDecl keeps scope index 0 until told otherwise, and
+    /// setParams does not tell it. Codegen assigns arguments by position and
+    /// never reads the index, but constant evaluation keys a parameter's
+    /// storage on it -- see CallRef::getOrigParam in clang's ExprConstant.cpp,
+    /// which maps a parameter through OrigCallee->getParamDecl(index). Leave
+    /// them all at 0 and they share the first parameter's slot, so the
+    /// derivative is right at run time and reads every argument as the first
+    /// one at compile time. See #2181.
+    void SetParams(clang::FunctionDecl* FD,
+                   llvm::ArrayRef<clang::ParmVarDecl*> params);
+
     /// If `T` represents an array or a pointer type then returns the
     /// corresponding array element or the pointee type. If `T` is a reference
     /// type then return the corresponding non-reference type. Otherwise, if `T`
@@ -256,7 +335,36 @@ namespace clad {
     /// Returns the same type as GetValueType but without const qualifier.
     clang::QualType GetNonConstValueType(clang::QualType T);
 
+    /// The unsigned integer type that holds every value of the integer type
+    /// `T`, after integral promotion: `T` itself, as written, when unsigned --
+    /// size_t stays size_t -- and its unsigned counterpart otherwise.
+    /// References and qualifiers are dropped.
+    clang::QualType getUnsignedType(clang::QualType T,
+                                    const clang::ASTContext& C);
+
+    /// The spelling of `T` closest to how it was written that code in `Where`
+    /// can name: `T` itself, or the first of its single-step desugarings that
+    /// is nameable there, or `T` unchanged when none is. The parts of a
+    /// pointer or function type are spelled the same way. Not the
+    /// canonical type: a public typedef of a private class is nameable while
+    /// the class it names is not.
+    clang::QualType getSpellableType(clang::QualType T,
+                                     const clang::DeclContext* Where,
+                                     const clang::ASTContext& C);
+
     clang::QualType getNonConstType(clang::QualType T, clang::Sema& S);
+
+    /// The lambda \p VD is initialized with, through the cleanups and
+    /// conversions around it -- a lambda capturing an object with a
+    /// non-trivial destructor is wrapped -- or null.
+    const clang::LambdaExpr* getLambdaInit(const clang::VarDecl* VD);
+
+    /// A reference to what \p R found, qualified by \p SS and followed by
+    /// \p TemplateArgs when given. Null when Sema rejects it.
+    clang::Expr* BuildDeclarationNameExpr(
+        clang::Sema& S, const clang::CXXScopeSpec& SS, clang::LookupResult& R,
+        bool ADL = false,
+        const clang::TemplateArgumentListInfo* TemplateArgs = nullptr);
 
     /// Builds and returns the init expression to initialise `clad::array` and
     /// `clad::array_ref` from a constant array.
@@ -272,9 +380,9 @@ namespace clad {
 
     bool IsCladValueAndPushforwardType(clang::QualType T);
 
-    /// If `T` is a `clad::pullback_state<Payload>` specialization, returns its
-    /// `Payload` argument; otherwise returns a null `QualType`. Used to thread
-    /// the payload a custom `reverse_forw` returns into its matching
+    /// If `T` is a `clad::pullback_state\<Payload\>` specialization, returns
+    /// its `Payload` argument; otherwise returns a null `QualType`. Used to
+    /// thread the payload a custom `reverse_forw` returns into its matching
     /// `pullback`, and to diagnose a mismatched pullback signature.
     clang::QualType GetPullbackStatePayload(clang::QualType T);
 
@@ -300,6 +408,11 @@ namespace clad {
     // static_cast<T&&>(E)
     // ```
     clang::Expr* BuildStaticCastToRValue(clang::Sema& semaRef, clang::Expr* E);
+    /// The member \p Name of \p Base, a clad::ValueAndPushforward or
+    /// clad::ValueAndAdjoint: an xvalue when declared as an rvalue reference,
+    /// as the call that returned it was.
+    clang::Expr* BuildResultMember(clang::Sema& S, clang::Scope* Sc,
+                                   clang::Expr* Base, llvm::StringRef Name);
 
     /// Returns true if expression `E` is PRValue or XValue.
     bool IsRValue(const clang::Expr* E);
@@ -355,11 +468,13 @@ namespace clad {
     ComputeMemExprPathType(clang::Sema& semaRef, clang::RecordDecl* RD,
                            llvm::ArrayRef<llvm::StringRef> fields);
 
-    /// Instantiate clad::class<TemplateArgs> type
+    /// Instantiate clad::class\<TemplateArgs\> type
     ///
+    /// \param[in] S the Sema to build the type with.
     /// \param[in] CladClassDecl the decl of the class that is going to be used
-    /// in the creation of the type \param[in] TemplateArgs an array of template
-    /// arguments \returns The created type clad::class<TemplateArgs>
+    /// in the creation of the type.
+    /// \param[in] TemplateArgs an array of template arguments.
+    /// \returns The created type clad::class\<TemplateArgs\>
     clang::QualType
     InstantiateTemplate(clang::Sema& S, clang::TemplateDecl* CladClassDecl,
                         llvm::ArrayRef<clang::QualType> TemplateArgs);
@@ -368,8 +483,17 @@ namespace clad {
                                         clang::TemplateArgumentListInfo& TLI);
     /// Builds the QualType of the derivative to be generated.
     ///
+    /// \param[in] S the Sema to build the type with.
+    /// \param[in] FD the function whose derivative is being typed.
+    /// \param[in] mode the differentiation mode the derivative is for.
+    /// \param[in] diffParams the parameters being differentiated with respect
+    /// to.
     /// \param[in] forCustomDerv If true, turns member functions into regular
     /// functions by moving the base to the parameters.
+    /// \param[in] shouldUseRestoreTracker whether the derivative takes a
+    /// trailing restore tracker.
+    /// \param[in] isForErrorEstimation whether the derivative also carries the
+    /// floating-point error estimate.
     clang::QualType GetDerivativeType(
         clang::Sema& S, const clang::FunctionDecl* FD, DiffMode mode,
         llvm::ArrayRef<const clang::ValueDecl*> diffParams,
@@ -377,33 +501,43 @@ namespace clad {
         bool isForErrorEstimation = false);
     /// Find declaration of clad::class templated type
     ///
-    /// \param[in] className name of the class to be found
+    /// \param[in] S the Sema to look the name up in.
+    /// \param[in] ClassName name of the class to be found
     /// \returns The declaration of the class with the name ClassName
     clang::TemplateDecl*
     LookupTemplateDeclInCladNamespace(clang::Sema& S,
                                       llvm::StringRef ClassName);
+
+    /// Remove only likelihood hints. Semantic statement attributes remain.
+    const clang::Stmt* SkipLikelihoodHints(const clang::Stmt* S);
 
     bool hasNonDifferentiableAttribute(const clang::Decl* D);
 
     bool hasNonDifferentiableAttribute(const clang::Expr* E);
 
     /// Returns true if \p RD is marked non-differentiable (opaque) by a
-    /// clad::custom_derivatives::nondifferentiable(clad::Tag<T>) declaration:
+    /// clad::custom_derivatives::nondifferentiable(clad::Tag\<T\>) declaration:
     /// clad must not clone its member bodies to synthesize a derivative. The
     /// built-in standard-library markers live in STLBuiltins.h; users extend
     /// the set by declaring their own.
     bool isNonDifferentiableType(clang::Sema& S,
                                  const clang::CXXRecordDecl* RD);
 
+    /// Whether a type explicitly opts out of saving its pre-call value when
+    /// passed through a mutable reference. The marker may be on the type or
+    /// its clad::Tag specialization.
+    bool hasNoPrimalTapeAttribute(clang::Sema& S,
+                                  const clang::CXXRecordDecl* RD);
+
     /// Returns true if the type \p CE fundamentally operates on -- the object
     /// of a member call, or the first argument of a free operator (`os << x`)
-    /// -- is non-differentiable (Tag-aware, so it honors clad::Tag<T> markers).
-    /// Deliberately narrower than hasNonDifferentiableAttribute(Expr): it looks
-    /// only at the operated-on type, so a differentiable call that merely
-    /// passes a marked value is unaffected. Callers use it to skip the call
-    /// outright (an early return) rather than to set the weaker nonDiff flag,
-    /// which in reverse mode would still schedule a pullback and descend into
-    /// the type's machinery.
+    /// -- is non-differentiable (Tag-aware, so it honors clad::Tag\<T\>
+    /// markers). Deliberately narrower than
+    /// hasNonDifferentiableAttribute(Expr): it looks only at the operated-on
+    /// type, so a differentiable call that merely passes a marked value is
+    /// unaffected. Callers use it to skip the call outright (an early return)
+    /// rather than to set the weaker nonDiff flag, which in reverse mode would
+    /// still schedule a pullback and descend into the type's machinery.
     bool callOperatesOnNonDifferentiableType(clang::Sema& S,
                                              const clang::CallExpr* CE);
 
@@ -423,19 +557,38 @@ namespace clad {
 
     /// Find namespace clad declaration.
     clang::NamespaceDecl* GetCladNamespace(clang::Sema& S);
-    /// Create clad::array<T> type.
+
+    /// Look up an entity in the clad namespace. The result may be empty.
+    clang::LookupResult tryLookupCladMethod(clang::Sema& S,
+                                            llvm::StringRef name);
+    /// Create clad::array\<T\> type.
     clang::QualType GetCladArrayOfType(clang::Sema& S, clang::QualType T);
-    /// Create clad::matrix<T> type.
+    /// Create clad::matrix\<T\> type.
     clang::QualType GetCladMatrixOfType(clang::Sema& S, clang::QualType T);
-    /// Create clad::array_ref<T> type.
+    /// Create clad::array_ref\<T\> type.
     clang::QualType GetCladArrayRefOfType(clang::Sema& S, clang::QualType T);
-    /// Returns type clad::Tag<T>
+    /// Returns type clad::Tag\<T\>
     clang::QualType GetCladTagOfType(clang::Sema& S, clang::QualType T);
     /// Builds a value-initialized temporary of type `T`, i.e. `T()`.
     clang::Expr* BuildDefaultConstructExpr(clang::Sema& S, clang::QualType T);
 
-    /// Returns type clad::Tag<T>()
+    /// Returns type clad::Tag\<T\>()
     clang::Expr* GetCladTagExpr(clang::Sema& S, clang::QualType T);
+
+    /// Whether a derivative of \p Mode is one clad calls from another
+    /// derivative, and so takes the template tags of its function.
+    bool TakesTemplateTags(DiffMode Mode);
+    /// The tags a called derivative of \p FD takes first, one for each
+    /// template argument of FD that a call does not deduce: clad::Tag\<T\>
+    /// for a type, std::integral_constant\<T, V\> for a value, as
+    /// std::in_place_type_t and std::in_place_index_t carry them. The
+    /// derivatives of pick\<0\> and pick\<1\> are not templates; the tags
+    /// tell them apart. An argument that is its parameter's default, such as
+    /// an enable_if parameter, is not part of the call and takes no tag.
+    /// \returns false if an argument has no tag yet: a template template
+    /// argument.
+    bool GetTemplateTagTypes(clang::Sema& S, const clang::FunctionDecl* FD,
+                             llvm::SmallVectorImpl<clang::QualType>& Tags);
 
     clang::QualType GetParameterDerivativeType(clang::Sema& S, DiffMode Mode,
                                                clang::QualType Type);
@@ -457,12 +610,51 @@ namespace clad {
     /// Returns true if QT is a non-const reference type.
     bool isNonConstReferenceType(clang::QualType QT);
 
+    /// Collects the parameters \p FD writes a result through: non-const lvalue
+    /// references to a real type. A function returning void has nowhere else
+    /// to put a result, so in forward mode these are what the derivative has
+    /// to hand back. Pointers are deliberately not counted -- how many
+    /// elements one addresses is not something the signature says.
+    void CollectOutputParams(
+        const clang::FunctionDecl* FD,
+        llvm::SmallVectorImpl<const clang::ParmVarDecl*>& outputParams);
+
+    /// Whether a forward derivative of \p FD may hand back the tangent of an
+    /// output parameter rather than returning void.
+    ///
+    /// The answer has to be the same here and in
+    /// ExtractDerivedFnTraitsForwMode, which decides the derivative's type
+    /// from the header side; where the two disagree CladFunction::execute
+    /// calls through a type whose return it has wrong, and reads a register
+    /// nothing wrote. That rules out instance member functions, whose
+    /// derivative the traits describe through a member pointer type with no
+    /// room for a changed return type. A static member function is addressed
+    /// as a plain function pointer, takes the free-function path in the
+    /// traits, and so belongs here.
+    bool CanReturnOutputTangent(const clang::FunctionDecl* FD);
+
     bool isCopyable(const clang::CXXRecordDecl* RD);
+    /// Whether a copy of an object of type \p T holds everything a function
+    /// can change through a reference to it: \p T reaches no other memory.
+    bool reachesNoOtherMemory(const clang::ASTContext& C, clang::QualType T);
+    /// Whether \p RD declares a const operator[] that returns a reference.
+    /// The standard containers follow this convention: such an operator[]
+    /// returns an element and does not modify the container. std::map, whose
+    /// operator[] inserts, has no const operator[].
+    bool hasElementAccessor(const clang::CXXRecordDecl* RD);
+    /// Whether \p E is `v[i]` on a class with an element accessor, where v
+    /// and i have no side effects. Such an expression refers to the same
+    /// element every time it is evaluated, like an array subscript.
+    bool isPureElementAccess(const clang::Expr* E, const clang::ASTContext& C);
 
     bool exprDependsOnVarDecl(const clang::Expr* E, const clang::VarDecl* VD);
 
     bool isLinearConstructor(const clang::CXXConstructorDecl* CD,
                              const clang::ASTContext& C);
+
+    /// Whether \p CE destroys an object without running any code: a pseudo
+    /// destructor call on a scalar, or a call to a trivial destructor.
+    bool isNoOpDestructorCall(const clang::CallExpr* CE);
 
     /// Returns true if the reverse-forward propagator for constructor \p CD is
     /// structurally elidable -- clad need not synthesize one because the plain
@@ -470,7 +662,7 @@ namespace clad {
     /// it. This holds for a trivial copy/move constructor (a shallow share of
     /// pointer/handle members), an aggregate, and a memberwise zero-or-copy
     /// initializer. A non-trivial constructor can additionally opt in with the
-    /// elidable_reverse_forw attribute on its custom reverse_forw (see
+    /// CLAD_ELIDABLE_REVERSE_FORW attribute on its custom reverse_forw (see
     /// hasElidableReverseForwAttribute) -- both paths are combined where the
     /// propagator is consumed.
     bool constructorReverseForwIsElidable(const clang::CXXConstructorDecl* CD,
@@ -478,26 +670,56 @@ namespace clad {
 
     /// Returns true if T allows to edit any memory.
     bool isMemoryType(clang::QualType T);
+    /// Returns true if a function returning T must return its adjoint too.
+    bool returnsAdjoint(clang::QualType T);
+
+    /// Resolve clad::zero_like(value), returning null without diagnostics
+    /// when no usable overload returns the primal type by value.
+    clang::FunctionDecl* LookupCladZeroLike(clang::Sema& S, clang::Expr* value);
 
     bool hasMemoryTypeParams(const clang::FunctionDecl* FD);
+
+    /// Whether FD writes into a record argument that owns memory, whose adjoint
+    /// only its reverse_forw can shape.
+    bool allocatesIntoRecordParam(const clang::FunctionDecl* FD);
 
     bool shouldUseRestoreTracker(const clang::FunctionDecl* FD);
     /// Returns true when E designates storage with automatic storage
     /// duration in the current function, reached through subscripts,
     /// members, dereferences or accessor calls. Such storage dies with the
     /// function, so a caller must not try to restore it.
+    /// \param E the expression to judge.
     /// \param asPointerValue E is a pointer rvalue passed to a callee, so
     /// the pointee is judged rather than the pointer variable's own slot.
+    /// \param followLocalReferences judge a local reference by what it is
+    /// bound to: right for lifetime, not for aliasing.
     bool designatesLocallyOwnedStorage(const clang::Expr* E,
-                                       bool asPointerValue = false);
+                                       bool asPointerValue = false,
+                                       bool followLocalReferences = false);
 
     bool IsDifferentiableType(clang::QualType T);
+
+    /// Whether the parameter \p Idx of the constructor \p Ctor does nothing
+    /// but set integer members, compare, and go on to constructors that do no
+    /// more with it. Its value then never reaches a real, and a tangent object
+    /// may be built with it.
+    bool OnlyCountsWith(const clang::CXXConstructorDecl* Ctor, unsigned Idx);
+    /// If \p CE is a memcpy or memmove whose destination or source, before
+    /// its conversion to `void*`, holds floating-point data, that type.
+    clang::QualType GetByteCopiedFloatingType(const clang::CallExpr* CE);
+
+    /// If \p CE is a memcpy or memmove from an array of a real floating type
+    /// to an array of the same type, a call to clad::byte_copy that copies
+    /// the same elements. Null otherwise.
+    clang::CallExpr* BuildTypedByteCopy(clang::Sema& S,
+                                        const clang::CallExpr* CE);
 
     bool hasElidableReverseForwAttribute(const clang::Decl* D);
 
     /// Returns true if FD can be differentiated as a pushforward
     /// And be used in the reverse mode.
-    bool canUsePushforwardInRevMode(const clang::FunctionDecl* FD);
+    bool canUsePushforwardInRevMode(const clang::FunctionDecl* FD,
+                                    const clang::CallExpr* CE);
 
     ///\returns a fully qualified type that is as close as coders would write.
     clang::QualType makeTypeReadable(clang::Sema& S, clang::QualType Ty);
@@ -513,8 +735,11 @@ namespace clad {
     bool isInjective(const clang::Expr* E, clang::AnalysisDeclContext* ADC);
     /// Checks if the return value of the given CallExpr is unused.
     bool hasUnusedReturnValue(clang::ASTContext& C, const clang::CallExpr* CE);
-    /// Returns true if the function is empty
-    bool hasEmptyBody(const clang::FunctionDecl* FD);
+    /// Whether the derivative \p FD is marked CLAD_NOOP_DERIVATIVE.
+    bool hasNoopDerivativeAttribute(const clang::FunctionDecl* FD);
+    /// Whether the derivative \p FD does nothing: it is marked
+    /// CLAD_NOOP_DERIVATIVE or its body is empty.
+    bool isNoopDerivative(const clang::FunctionDecl* FD);
     /// For an expr E, decides if we should recompute it or store it.
     /// This is the central point for checkpointing.
     bool ShouldRecompute(const clang::Expr* E, const clang::ASTContext& C);
@@ -522,12 +747,34 @@ namespace clad {
     /// variable and replace E's further usage by a reference to that variable
     /// to avoid recomputation.
     bool UsefulToStore(const clang::Expr* E);
+    /// Re-declares \p TND in \p DC, keeping the type as it was written rather
+    /// than what it resolves to. An alias is where portable code picks a
+    /// precision, a width or an index type, so resolving it would pin the copy
+    /// to the answer one platform gave.
+    clang::TypedefNameDecl*
+    BuildTypedefNameDecl(clang::ASTContext& C, clang::DeclContext* DC,
+                         clang::SourceLocation StartLoc,
+                         clang::SourceLocation IdLoc,
+                         const clang::TypedefNameDecl* TND);
     /// Builds a reference to one of Enzyme's activity markers, the globals it
     /// matches by name to decide which arguments are differentiated.
     /// They are declared in EnzymeBuiltins.h, which Differentiator.h
     /// includes.
     clang::Expr* BuildEnzymeActivityMarkerRef(clang::Sema& semaRef,
                                               llvm::StringRef name);
+    /// Returns true if the expression represents a CUDA built-in variable
+    /// like threadIdx, blockIdx, blockDim, or gridDim.
+    bool isCUDABuiltinVariable(const clang::Expr* E,
+                               const clang::ASTContext& Context);
+
+    /// Adds to \p Written every variable \p S may write. "Write" is meant
+    /// broadly, as anything that can change a value: an assignment, an
+    /// increment, a taken address, or a bind to a non-const reference.
+    /// Over-approximates on purpose -- callers ask whether a variable is
+    /// provably left alone, and a name that only might be written is no use
+    /// to them.
+    void collectWrittenVars(clang::Stmt* S,
+                            std::set<const clang::VarDecl*>& Written);
     } // namespace utils
     } // namespace clad
 

@@ -2,6 +2,10 @@
 // RUN: ./TBR.out | %filecheck_exec %s
 // RUN: %cladclang %s -I%S/../../include -oTBR.out
 // RUN: ./TBR.out | %filecheck_exec %s
+// RUN: %cladclang -Xclang -plugin-arg-clad -Xclang -disable-tbr \
+// RUN:   -Xclang -plugin-arg-clad -Xclang -fenable-analysis=activity %s \
+// RUN:   -I%S/../../include -oTBR.out
+// RUN: ./TBR.out | %filecheck_exec %s
 
 #include "clad/Differentiator/Differentiator.h"
 
@@ -15,18 +19,18 @@ double f1(double x) {
 //CHECK: void f1_grad(double x, double *_d_x) {
 //CHECK-NEXT:     int _d_i = 0;
 //CHECK-NEXT:     int i = 0;
-//CHECK-NEXT:     clad::tape<double> _t1 = {};
+//CHECK-NEXT:     double _t1[3];
 //CHECK-NEXT:     double _d_t = 0.;
 //CHECK-NEXT:     double t = 1;
-//CHECK-NEXT:     unsigned {{int|long}} _t0 = 0;
+//CHECK-NEXT:     unsigned int _t0;
 //CHECK-NEXT:     for (i = 0; i < 3; i++) {
-//CHECK-NEXT:         _t0++;
-//CHECK-NEXT:         clad::push(_t1, t);
+//CHECK-NEXT:         _t1[i] = t;
 //CHECK-NEXT:         t *= x;
 //CHECK-NEXT:     }
 //CHECK-NEXT:     _d_t += 1;
-//CHECK-NEXT:     for (; _t0; _t0--) {
-//CHECK-NEXT:         t = clad::pop(_t1);
+//CHECK-NEXT:     for (_t0 = 3{{U|UL|ULL}}; _t0; _t0--) {
+//CHECK-NEXT:         i--;
+//CHECK-NEXT:         t = _t1[i];
 //CHECK-NEXT:         double _r_d0 = _d_t;
 //CHECK-NEXT:         _d_t = 0.;
 //CHECK-NEXT:         _d_t += _r_d0 * x;
@@ -252,6 +256,120 @@ double f6(double x, double y) {
 //CHECK-NEXT: }
 
 
+struct Buf { 
+  double* p;
+};
+
+double f7(double x) {
+  double s[2] = {0, 0};
+  Buf b{s};
+  b.p[0] = x * x;
+  b.p[1] = 3 * x;
+  return b.p[0] + b.p[1];
+}
+
+//CHECK: void f7_grad(double x, double *_d_x) {
+//CHECK-NEXT:     double _d_s[2] = {0};
+//CHECK-NEXT:     double s[2] = {0, 0};
+//CHECK-NEXT:     Buf _d_b = {_d_s};
+//CHECK-NEXT:     Buf b{s};
+//CHECK-NEXT:     b.p[0] = x * x;
+//CHECK-NEXT:     b.p[1] = 3 * x;
+//CHECK-NEXT:     {
+//CHECK-NEXT:         _d_b.p[0] += 1;
+//CHECK-NEXT:         _d_b.p[1] += 1;
+//CHECK-NEXT:     }
+//CHECK-NEXT:     {
+//CHECK-NEXT:         double _r_d1 = _d_b.p[1];
+//CHECK-NEXT:         _d_b.p[1] = 0.;
+//CHECK-NEXT:         *_d_x += 3 * _r_d1;
+//CHECK-NEXT:     }
+//CHECK-NEXT:     {
+//CHECK-NEXT:         double _r_d0 = _d_b.p[0];
+//CHECK-NEXT:         _d_b.p[0] = 0.;
+//CHECK-NEXT:         *_d_x += _r_d0 * x;
+//CHECK-NEXT:         *_d_x += x * _r_d0;
+//CHECK-NEXT:     }
+//CHECK-NEXT: }
+
+struct Wrapper {
+  double val;
+  Wrapper(const double& v) : val(v) {}
+};
+
+double f8(double x) {
+  double t = x;
+  double s = t * t;
+  Wrapper w(t); // `w` only reads `t`
+  s += w.val;
+  t = 5; // `t` should be stored because `t * t` uses it
+  return s; // x^2 + x
+}
+
+//CHECK: void f8_grad(double x, double *_d_x) {
+//CHECK-NEXT:     double _d_t = 0.;
+//CHECK-NEXT:     double t = x;
+//CHECK-NEXT:     double _d_s = 0.;
+//CHECK-NEXT:     double s = t * t;
+//CHECK-NEXT:     Wrapper w(t);
+//CHECK-NEXT:     Wrapper _d_w(_d_t);
+//CHECK-NEXT:     s += w.val;
+//CHECK-NEXT:     double _t0 = t;
+//CHECK-NEXT:     t = 5;
+//CHECK-NEXT:     _d_s += 1;
+//CHECK-NEXT:     {
+//CHECK-NEXT:         t = _t0;
+//CHECK-NEXT:         _d_t = 0.;
+//CHECK-NEXT:     }
+//CHECK-NEXT:     {
+//CHECK-NEXT:         double _r_d0 = _d_s;
+//CHECK-NEXT:         _d_w.val += _r_d0;
+//CHECK-NEXT:     }
+//CHECK-NEXT:     Wrapper::constructor_pullback(t, &_d_w, &_d_t);
+//CHECK-NEXT:     {
+//CHECK-NEXT:         _d_t += _d_s * t;
+//CHECK-NEXT:         _d_t += t * _d_s;
+//CHECK-NEXT:     }
+//CHECK-NEXT:     *_d_x += _d_t;
+//CHECK-NEXT: }
+
+struct Indexed {
+  double x;
+};
+
+double memberSubscript(double a) {
+  Indexed arr[3] = {{a}, {a * a}, {1.}};
+  double sum = 0;
+  for (int i = 0; i < 3; ++i)
+    sum += arr[i].x * a;
+  return sum;
+}
+
+//CHECK: void memberSubscript_grad(double a, double *_d_a) {
+//CHECK-NEXT:     int _d_i = 0;
+//CHECK-NEXT:     int i = 0;
+//CHECK-NEXT:     Indexed _d_arr[3] = {{[{]}}{0.}, {0.}, {0.}};
+//CHECK-NEXT:     Indexed arr[3] = {{[{]}}{a}, {a * a}, {1.}};
+//CHECK-NEXT:     double _d_sum = 0.;
+//CHECK-NEXT:     double sum = 0;
+//CHECK-NEXT:     unsigned int _t0;
+//CHECK-NEXT:     for (i = 0; i < 3; ++i) {
+//CHECK-NEXT:         sum += arr[i].x * a;
+//CHECK-NEXT:     }
+//CHECK-NEXT:     _d_sum += 1;
+//CHECK-NEXT:     for (_t0 = 3{{U|UL|ULL}}; _t0; _t0--) {
+//CHECK-NEXT:         --i;
+//CHECK-NEXT:         double _r_d0 = _d_sum;
+//CHECK-NEXT:         _d_arr[i].x += _r_d0 * a;
+//CHECK-NEXT:         *_d_a += arr[i].x * _r_d0;
+//CHECK-NEXT:     }
+//CHECK-NEXT:     {
+//CHECK-NEXT:         *_d_a += _d_arr[0].x;
+//CHECK-NEXT:         *_d_a += _d_arr[1].x * a;
+//CHECK-NEXT:         *_d_a += a * _d_arr[1].x;
+//CHECK-NEXT:     }
+//CHECK-NEXT: }
+
 #define TEST(F, x) { \
   result[0] = 0; \
   auto F##grad = clad::gradient<clad::opts::enable_tbr>(F);\
@@ -274,4 +392,7 @@ int main() {
   TEST2(f4, 3, 4) // CHECK-EXEC: {4.00, 3.00}
   TEST2(f5, 8, 3) // CHECK-EXEC: {3.00, 7.00}
   TEST2(f6, 5, 2) // CHECK-EXEC: {2.00, 5.00}
+  TEST(f7, 2); // CHECK-EXEC: {7.00}
+  TEST(f8, 2); // CHECK-EXEC: {5.00}
+  TEST(memberSubscript, 2); // CHECK-EXEC: {17.00}
 }

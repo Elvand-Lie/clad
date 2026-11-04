@@ -14,6 +14,7 @@
 #include "llvm/ADT/StringRef.h"
 
 namespace clad {
+/// \ingroup visitors
 class ReverseModeForwPassVisitor : public ReverseModeVisitor {
 private:
   Stmts m_Globals;
@@ -31,9 +32,11 @@ public:
   clang::Expr* dfdx() override { return nullptr; }
   DelayedStoreResult DelayedGlobalStoreAndRef(clang::Expr* E,
                                               llvm::StringRef prefix = "_t",
-                                              bool forceStore = false) override;
-  StmtDiff StoreAndRestore(clang::Expr* E, llvm::StringRef prefix = "_t",
-                           bool moveToTape = false) override;
+                                              bool forceStore = false,
+                                              bool isNeeded = true) override;
+  StmtDiff StoreAndRestore(
+      clang::Expr* E, llvm::StringRef prefix = "_t", bool moveToTape = false,
+      llvm::SmallVectorImpl<clang::Stmt*>* restoreAgain = nullptr) override;
   DeclDiff<clang::VarDecl>
   DifferentiateVarDecl(const clang::VarDecl* VD,
                        bool keepLocal = false) override;

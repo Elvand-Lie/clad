@@ -15,6 +15,13 @@
 #include <type_traits>
 #include <utility>
 
+/// Maximum bytes of freed tape slabs each thread keeps for reuse. Without
+/// the pool, a derivative called in a loop allocates its tape slabs again on
+/// every call.
+#ifndef CLAD_TAPE_SLAB_POOL_BYTES
+#define CLAD_TAPE_SLAB_POOL_BYTES (64u << 20)
+#endif
+
 #ifndef __CUDA_ARCH__
 #include <cstring>
 #ifndef __CUDACC__
@@ -248,10 +255,21 @@ public:
 /// (SBO), primarily used for storing values in reverse-mode AD. Stores elements
 /// in a static buffer first, then falls back to dynamically allocated linked
 /// slabs if capacity exceeds SBO.
+/// The lock of a multithreaded tape. A single-threaded tape has none, so it
+/// carries no mutex, which is 64 bytes on macOS and a destructor call per
+/// tape object, of which a generated pullback keeps hundreds.
+template <bool is_multithread> struct tape_lock {};
+#ifndef __CUDACC__
+template <> struct tape_lock<true> {
+  mutable std::mutex m_TapeMutex;
+  std::mutex& mutex() const { return m_TapeMutex; }
+};
+#endif
+
 template <typename T, std::size_t SBO_SIZE = 64, std::size_t SLAB_SIZE = 1024,
           bool is_multithread = false, bool DiskOffload = false,
           bool GpuOffload = false>
-class tape_impl {
+class tape_impl : public tape_lock<is_multithread> {
   /// Storage planning for slabs kept in memory (RAM).
   /// Provides access to the raw data buffer.
   struct RAMStorage {
@@ -369,6 +387,76 @@ public:
     CUDA_HOST_DEVICE Slab() : prev(nullptr), next(nullptr) {}
   };
 
+private:
+#ifndef __CUDA_ARCH__
+  /// Free list of the slabs released by tapes of this type on this thread.
+  /// Only slabs in RAM; disk and GPU slabs are managed by their own code.
+  struct SlabPool {
+    Slab* head = nullptr;
+    std::size_t bytes = 0;
+    SlabPool() = default;
+    SlabPool(const SlabPool&) = delete;
+    SlabPool& operator=(const SlabPool&) = delete;
+    SlabPool(SlabPool&&) = delete;
+    SlabPool& operator=(SlabPool&&) = delete;
+    ~SlabPool() {
+      while (head) {
+        Slab* next = head->next;
+        // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+        delete head;
+        head = next;
+      }
+      slabPoolGone() = true;
+    }
+  };
+  static SlabPool& slabPool() {
+    static thread_local SlabPool pool;
+    return pool;
+  }
+  /// Set when this thread's pool is destroyed. Tapes destroyed later, such as
+  /// static or thread_local tapes, then delete their slabs directly. A bool
+  /// has no destructor, so it is still readable at that point.
+  static bool& slabPoolGone() {
+    static thread_local bool gone = false;
+    return gone;
+  }
+#endif
+  static constexpr bool kPoolsSlabs = !DiskOffload && !GpuOffload;
+
+  /// Returns a slab from the pool, or allocates a new one.
+  CUDA_HOST_DEVICE static Slab* acquireSlab() {
+#ifndef __CUDA_ARCH__
+    if (kPoolsSlabs && !slabPoolGone()) {
+      SlabPool& pool = slabPool();
+      if (Slab* slab = pool.head) {
+        pool.head = slab->next;
+        pool.bytes -= sizeof(Slab);
+        slab->next = nullptr;
+        return slab;
+      }
+    }
+#endif
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+    return new Slab();
+  }
+  /// Puts a slab whose elements were destroyed into the pool, or deletes it
+  /// if the pool is full or already destroyed.
+  CUDA_HOST_DEVICE static void releaseSlab(Slab* slab) {
+#ifndef __CUDA_ARCH__
+    if (kPoolsSlabs && !slabPoolGone() &&
+        slabPool().bytes + sizeof(Slab) <= CLAD_TAPE_SLAB_POOL_BYTES) {
+      SlabPool& pool = slabPool();
+      slab->prev = nullptr;
+      slab->next = pool.head;
+      pool.head = slab;
+      pool.bytes += sizeof(Slab);
+      return;
+    }
+#endif
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+    delete slab;
+  }
+
 protected:
   // std::aligned_storage_t<sizeof(T), alignof(T)> m_static_buffer[SBO_SIZE];
   // For now use the implementation below as above implementation is not
@@ -380,9 +468,12 @@ protected:
   Slab* m_tail = nullptr;
   std::size_t m_size = 0;
   std::size_t m_capacity = SBO_SIZE;
-#ifndef __CUDACC__
-  mutable std::mutex m_TapeMutex;
-#endif
+  /// The slab the last indexed access landed in, and its number counted from
+  /// the head. A sweep reads a recorded run in order, so the next element is
+  /// in this slab or the one beside it, and the walk from an end is spared.
+  /// Left alone by the multithreaded tape, where a read must not write.
+  Slab* m_cursor = nullptr;
+  std::size_t m_cursor_no = 0;
   /// Holds current state related to disk offloading, including the file manager
   /// and also keep track of active/maximum RAM slabs.
 #ifndef __CUDA_ARCH__
@@ -530,9 +621,8 @@ protected:
             T* data = candidate->elements();
 
             async_state->m_AsyncWrite =
-                std::async(std::launch::async, [dm, data, candidate]() {
-                  candidate->disk_offset = dm->write_slab(data);
-                });
+                std::async(std::launch::async, &tape_impl::write_slab_async, dm,
+                           data, candidate);
           }
         }
 #endif
@@ -629,11 +719,12 @@ public:
   using const_iterator = tape_iterator<const T, SBO_SIZE, SLAB_SIZE,
                                        is_multithread, DiskOffload, GpuOffload>;
 
-#ifndef __CUDACC__
-  std::mutex& mutex() const { return m_TapeMutex; }
-#endif
-
-  CUDA_HOST_DEVICE tape_impl() = default;
+  // Not defaulted: clad declares its tapes as `clad::tape<T> _t = {};`, and
+  // value-initializing a class whose default constructor is not
+  // user-provided zero-fills it first, inline buffer included. Every member
+  // that needs a value has an initializer of its own.
+  // NOLINTNEXTLINE(modernize-use-equals-default)
+  CUDA_HOST_DEVICE tape_impl() {}
 
   CUDA_HOST_DEVICE ~tape_impl() { clear(); }
 
@@ -643,6 +734,37 @@ public:
   tape_impl(tape_impl&& other) = delete;
   tape_impl& operator=(tape_impl&& other) = delete;
 
+  /// Points m_tail at the slab the next element belongs in, allocating one
+  /// if the tape is full. Runs once every SLAB_SIZE elements, so it is kept
+  /// out of line: inlined, its cost pushes emplace_back -- and with it every
+  /// clad::push -- over clang's inline threshold, and the pushes stop being
+  /// inlined into the generated pullbacks.
+  CLAD_NOINLINE CUDA_HOST_DEVICE void advance_slab() {
+    if (m_size == m_capacity) {
+      check_and_evict();
+
+      Slab* new_slab = acquireSlab();
+      if (DiskOffload || GpuOffload) {
+        if (GpuOffload && !new_slab->is_in_ram)
+          getDiskInfo().m_ActiveVramSlabs++;
+        else
+          getDiskInfo().m_ActiveSlabs++;
+      }
+
+      if (!m_head)
+        m_head = new_slab;
+      else {
+        m_tail->next = new_slab;
+        new_slab->prev = m_tail;
+      }
+      m_capacity += SLAB_SIZE;
+    }
+    if (m_size == SBO_SIZE)
+      m_tail = m_head;
+    else
+      m_tail = m_tail->next;
+  }
+
   /// Add new value of type T constructed from args to the end of the tape.
   template <typename... ArgsT>
   CUDA_HOST_DEVICE void emplace_back(ArgsT&&... args) {
@@ -651,31 +773,8 @@ public:
           sbo_elements() + m_size))) T(std::forward<ArgsT>(args)...);
     } else {
       const auto offset = (m_size - SBO_SIZE) % SLAB_SIZE;
-      if (!offset) {
-        if (m_size == m_capacity) {
-          check_and_evict();
-
-          Slab* new_slab = new Slab();
-          if (DiskOffload || GpuOffload) {
-            if (GpuOffload && !new_slab->is_in_ram)
-              getDiskInfo().m_ActiveVramSlabs++;
-            else
-              getDiskInfo().m_ActiveSlabs++;
-          }
-
-          if (!m_head)
-            m_head = new_slab;
-          else {
-            m_tail->next = new_slab;
-            new_slab->prev = m_tail;
-          }
-          m_capacity += SLAB_SIZE;
-        }
-        if (m_size == SBO_SIZE)
-          m_tail = m_head;
-        else
-          m_tail = m_tail->next;
-      }
+      if (!offset)
+        advance_slab();
 #if defined(__CUDACC__) && !defined(__CUDA_ARCH__)
       // Only H2D transfer if the slab is actively in VRAM
       if (GpuOffload && !m_tail->is_in_ram) {
@@ -724,6 +823,27 @@ public:
     return *(m_tail->elements() + index);
   }
 
+  /// Access the value `i` positions from the end (0 being the last) without
+  /// removing it, so a recorded run can be read more than once. Walks back
+  /// from the tail rather than forward from the head, which keeps a read near
+  /// the end cheap however long the tape has grown.
+  CUDA_HOST_DEVICE reference peek_back(std::size_t i) {
+    assert(i < m_size);
+    std::size_t index = m_size - 1 - i;
+    if (index < SBO_SIZE)
+      return *(sbo_elements() + index);
+    std::size_t base =
+        SBO_SIZE + (((m_size - 1 - SBO_SIZE) / SLAB_SIZE) * SLAB_SIZE);
+    Slab* slab = m_tail;
+    while (index < base) {
+      slab = slab->prev;
+      base -= SLAB_SIZE;
+    }
+    if (DiskOffload || GpuOffload)
+      ensure_loaded(slab);
+    return *(slab->elements() + (index - base));
+  }
+
   CUDA_HOST_DEVICE const_reference back() const {
     assert(m_size);
     std::size_t index = m_size - 1;
@@ -749,32 +869,51 @@ public:
   }
 
 #ifndef __CUDA_ARCH__
+private:
+  // The work std::async runs is a member function, not a lambda: std::async
+  // keeps what it calls in a std::tuple, and libstdc++ 14's C++23 tuple does
+  // not compile with a lambda in it under clang 17. Every tape that pops
+  // instantiates the prefetch; every offloading tape that pushes, the write
+  // as well.
+
+  /// Writes \p data, a slab's elements, through \p dm on a worker thread.
+  static void write_slab_async(detail::DiskManager<T, SLAB_SIZE>* dm, T* data,
+                               Slab* candidate) {
+    candidate->disk_offset = dm->write_slab(data);
+  }
+
+  /// Reads back the slabs below the tail that were spilled to disk, as many
+  /// as there is room for in RAM.
+  void reverse_prefetch() {
+    DiskInfo& info = getDiskInfo();
+
+    std::size_t slabs_to_fetch = info.m_MaxRamSlabs - info.m_ActiveSlabs;
+    Slab* current = m_tail;
+
+    while (current && slabs_to_fetch > 0) {
+      if (current->is_on_disk) {
+        current->allocate();
+        info.m_DiskManager->read_slab(current->elements(),
+                                      current->disk_offset);
+        current->is_on_disk = false;
+
+        info.m_ActiveSlabs++;
+        slabs_to_fetch--;
+      }
+      current = current->prev;
+    }
+  }
+
   void trigger_reverse_prefetch() {
     DiskInfo& out_info = getDiskInfo();
     auto* async_state = static_cast<HostAsyncState*>(out_info.m_AsyncState);
 
-    async_state->m_AsyncRead = std::async(std::launch::async, [this]() {
-      DiskInfo& info = getDiskInfo();
-
-      std::size_t slabs_to_fetch = info.m_MaxRamSlabs - info.m_ActiveSlabs;
-      Slab* current = m_tail;
-
-      while (current && slabs_to_fetch > 0) {
-        if (current->is_on_disk) {
-          current->allocate();
-          info.m_DiskManager->read_slab(current->elements(),
-                                        current->disk_offset);
-          current->is_on_disk = false;
-
-          info.m_ActiveSlabs++;
-          slabs_to_fetch--;
-        }
-        current = current->prev;
-      }
-    });
+    async_state->m_AsyncRead =
+        std::async(std::launch::async, &tape_impl::reverse_prefetch, this);
   }
 #endif
 
+public:
   /// Remove the last value from the tape.
   CUDA_HOST_DEVICE void pop_back() {
     assert(m_size);
@@ -811,6 +950,8 @@ public:
             trigger_reverse_prefetch();
 
           m_tail->next = nullptr;
+          if (m_cursor == old_tail)
+            m_cursor = nullptr;
           delete old_tail;
           m_capacity -= SLAB_SIZE;
         }
@@ -820,31 +961,50 @@ public:
   }
 
 private:
+  /// The slab numbered \p no, counted from the head, reached from whichever
+  /// of the head, the tail and the last access is nearest. Every slab from
+  /// the head to the tail exists (pop_back frees only past the tail), so the
+  /// walk never runs off the list.
+  CUDA_HOST_DEVICE Slab* slab_no(std::size_t no) {
+    assert(m_size > SBO_SIZE && "no slab is in use");
+    std::size_t tail_no = (m_size - 1 - SBO_SIZE) / SLAB_SIZE;
+    assert(no <= tail_no && "past the last slab");
+    Slab* from = m_head;
+    std::size_t from_no = 0;
+    if (tail_no - no < no) {
+      from = m_tail;
+      from_no = tail_no;
+    }
+    if (!is_multithread && m_cursor) {
+      std::size_t d = m_cursor_no < no ? no - m_cursor_no : m_cursor_no - no;
+      std::size_t best = from_no < no ? no - from_no : from_no - no;
+      if (d < best) {
+        from = m_cursor;
+        from_no = m_cursor_no;
+      }
+    }
+    while (from_no < no) {
+      from = from->next;
+      ++from_no;
+    }
+    while (from_no > no) {
+      from = from->prev;
+      --from_no;
+    }
+    if (!is_multithread) {
+      m_cursor = from;
+      m_cursor_no = no;
+    }
+    return from;
+  }
+
   /// Returns pointer to element at specified index, handling SBO or slab lookup
   CUDA_HOST_DEVICE T* at(std::size_t index) {
     if (index < SBO_SIZE)
       return sbo_elements() + index;
-
-    Slab* slab = m_head;
-    std::size_t idx = (index - SBO_SIZE) / SLAB_SIZE;
-    while (idx--)
-      slab = slab->next;
-
+    Slab* slab = slab_no((index - SBO_SIZE) / SLAB_SIZE);
     if (DiskOffload || GpuOffload)
       ensure_loaded(slab);
-
-    return slab->elements() + ((index - SBO_SIZE) % SLAB_SIZE);
-  }
-
-  CUDA_HOST_DEVICE const T* at(std::size_t index) const {
-    if (index < SBO_SIZE)
-      return sbo_elements() + index;
-    Slab* slab = m_head;
-    std::size_t idx = (index - SBO_SIZE) / SLAB_SIZE;
-    while (idx--)
-      slab = slab->next;
-
-    // Const version cannot ensure loaded if DiskOffload is true
     return slab->elements() + ((index - SBO_SIZE) % SLAB_SIZE);
   }
 
@@ -898,11 +1058,18 @@ private:
     getDiskInfo().m_ActiveVramSlabs = 0;
   }
 
-  void clear_impl(std::false_type) {
+  CUDA_HOST_DEVICE void clear_impl(std::false_type) {
     std::size_t count = m_size;
     for (std::size_t i = 0; i < SBO_SIZE && count > 0; ++i, --count)
       destroy_element(&sbo_elements()[i]);
+    if (m_head)
+      release_slabs(count);
+  }
 
+  /// Destroys the elements in the slabs and releases the slabs. Out of line,
+  /// so that destroying a tape without slabs, the common case, still inlines
+  /// into the derivative.
+  CLAD_NOINLINE CUDA_HOST_DEVICE void release_slabs(std::size_t count) {
     Slab* slab = m_head;
     while (slab) {
       T* elems = slab->elements();
@@ -910,15 +1077,15 @@ private:
         destroy_element(elems + i);
       Slab* tmp = slab;
       slab = slab->next;
-      // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
-      delete tmp;
+      releaseSlab(tmp);
     }
   }
 
-  void clear() {
+  CUDA_HOST_DEVICE void clear() {
     clear_impl(std::integral_constant < bool, DiskOffload || GpuOffload > {});
     m_head = nullptr;
     m_tail = nullptr;
+    m_cursor = nullptr;
     m_size = 0;
     m_capacity = SBO_SIZE;
   }
@@ -932,8 +1099,10 @@ private:
       (*arr)[i].~ElTy();
   }
 };
-template <typename T, std::size_t SBO_SIZE, std::size_t SLAB_SIZE,
-          bool is_multithread, bool DiskOffload, bool GpuOffload>
+/// Tape type used for storing values in reverse-mode AD inside loops.
+template <typename T, std::size_t SBO_SIZE = 64, std::size_t SLAB_SIZE = 1024,
+          bool is_multithread = false, bool DiskOffload = false,
+          bool GpuOffload = false>
 using tape =
     tape_impl<T, SBO_SIZE, SLAB_SIZE, is_multithread, DiskOffload, GpuOffload>;
 } // namespace clad

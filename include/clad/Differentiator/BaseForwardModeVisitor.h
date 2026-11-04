@@ -9,6 +9,7 @@
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/StmtOpenMP.h"
 #include "clang/AST/StmtVisitor.h"
+#include "clang/AST/Type.h"
 #include "clang/Sema/Sema.h"
 
 #include "llvm/ADT/SmallVector.h"
@@ -26,12 +27,18 @@
 namespace clad {
 /// A visitor for processing the function code in forward mode.
 /// Used to compute derivatives by clad::differentiate.
+/// \ingroup visitors
 class BaseForwardModeVisitor
     : public clang::ConstStmtVisitor<BaseForwardModeVisitor, StmtDiff>,
       public clang::ConstOMPClauseVisitor<BaseForwardModeVisitor,
                                           clang::OMPClause*>,
       public VisitorBase {
   unsigned m_IndependentVarIndex = ~0;
+  /// How many operands evaluated only on some paths, or once per iteration
+  /// -- the branches of `?:`, the right side of `&&` and `||`, a loop's
+  /// condition -- the visitor is inside. A statement emitted for one of them
+  /// would run once, on every path.
+  unsigned m_ConditionalOperandDepth = 0;
 
 protected:
   const clang::ValueDecl* m_IndependentVar = nullptr;
@@ -64,6 +71,21 @@ public:
   }
 
   virtual void ExecuteInsidePushforwardFunctionBlock() {}
+
+  /// Gives the derivatives of the two branches of a ?: of type \p T the same
+  /// form. Nothing to do here; vector mode turns a scalar zero beside a vector
+  /// of tangents into a vector of zeros.
+  virtual void matchBranchTangents(StmtDiff& /*TrueDiff*/,
+                                   StmtDiff& /*FalseDiff*/,
+                                   clang::QualType /*T*/) {}
+
+  /// The tangent of \p Cast, whose operand's tangent is \p Dx, where it is
+  /// not \p Dx cast the same way; null otherwise. Vector mode does not cast a
+  /// vector of tangents to a number.
+  virtual clang::Expr* castTangent(clang::Expr* /*Dx*/,
+                                   const clang::CastExpr* /*Cast*/) {
+    return nullptr;
+  }
 
   /// \returns \p read, the derivative expression dereferencing \p tangent,
   /// wrapped so that it evaluates to \p zero instead of dereferencing a null
@@ -99,14 +121,18 @@ public:
   VisitArraySubscriptExpr(const clang::ArraySubscriptExpr* ASE);
   StmtDiff VisitBinaryOperator(const clang::BinaryOperator* BinOp);
   StmtDiff VisitCallExpr(const clang::CallExpr* CE);
+  StmtDiff VisitCXXMemberCallExpr(const clang::CXXMemberCallExpr* CE);
   StmtDiff VisitCompoundStmt(const clang::CompoundStmt* CS);
   StmtDiff VisitConditionalOperator(const clang::ConditionalOperator* CO);
   StmtDiff VisitCXXBoolLiteralExpr(const clang::CXXBoolLiteralExpr* BL);
   StmtDiff VisitCharacterLiteral(const clang::CharacterLiteral* CL);
   StmtDiff VisitStringLiteral(const clang::StringLiteral* SL);
+  StmtDiff VisitConstantExpr(const clang::ConstantExpr* CE);
   StmtDiff VisitCXXDefaultArgExpr(const clang::CXXDefaultArgExpr* DE);
   StmtDiff VisitDeclRefExpr(const clang::DeclRefExpr* DRE);
   StmtDiff VisitDeclStmt(const clang::DeclStmt* DS);
+  /// The declarations of \p DS, which are not a structured binding.
+  StmtDiff DifferentiateDeclStmt(const clang::DeclStmt* DS);
   virtual StmtDiff VisitFloatingLiteral(const clang::FloatingLiteral* FL);
   StmtDiff VisitForStmt(const clang::ForStmt* FS);
   StmtDiff VisitIfStmt(const clang::IfStmt* If);
@@ -120,6 +146,7 @@ public:
   StmtDiff VisitParenExpr(const clang::ParenExpr* PE);
   virtual StmtDiff VisitReturnStmt(const clang::ReturnStmt* RS);
   StmtDiff VisitStmt(const clang::Stmt* S);
+  StmtDiff VisitAttributedStmt(const clang::AttributedStmt* S);
   StmtDiff VisitUnaryOperator(const clang::UnaryOperator* UnOp);
   // Decl is not Stmt, so it cannot be visited directly.
   virtual DeclDiff<clang::VarDecl>
@@ -149,6 +176,7 @@ public:
   StmtDiff VisitCXXNullPtrLiteralExpr(const clang::CXXNullPtrLiteralExpr* NPL);
   StmtDiff
   VisitUnaryExprOrTypeTraitExpr(const clang::UnaryExprOrTypeTraitExpr* UE);
+  StmtDiff VisitTypeTraitExpr(const clang::TypeTraitExpr* TTE);
   StmtDiff VisitPseudoObjectExpr(const clang::PseudoObjectExpr* POE);
   StmtDiff VisitSubstNonTypeTemplateParmExpr(
       const clang::SubstNonTypeTemplateParmExpr* NTTP);
@@ -206,6 +234,22 @@ protected:
       llvm::SmallVectorImpl<clang::Expr*>& clonedArgs,
       llvm::SmallVectorImpl<clang::Expr*>& derivedArgs);
 
+  clang::QualType GetLambdaPushforwardType(const clang::LambdaExpr* LE);
+
+  /// Builds the pushforward lambda for LE
+  clang::Expr* buildPushforwardLambda(const clang::LambdaExpr* LE);
+
+  /// Handles the arguments of the construction \p E that have no tangent.
+  ///
+  /// \return The zero object of E's type when no argument carries anything
+  /// to differentiate; otherwise null, with the slots of \p derivedArgs that
+  /// were null filled in so the derived object can be built at all.
+  clang::Expr*
+  FillMissingCtorTangents(const clang::Expr* E,
+                          llvm::ArrayRef<const clang::Expr*> args,
+                          llvm::ArrayRef<clang::Expr*> clonedArgs,
+                          llvm::MutableArrayRef<clang::Expr*> derivedArgs);
+
 private:
   /// Prepares the derivative function parameters.
   void
@@ -217,6 +261,10 @@ private:
   ///   double _d_x = 1;
   ///   double _d_y = 0;
   void GenerateSeeds(const clang::FunctionDecl* dFD);
+  /// The tangent a void-returning primal's derivative should return: the one
+  /// belonging to its sole output parameter. Null whenever the derivative
+  /// returns void, which is every other case.
+  clang::Expr* GetOutputParamTangent();
 };
 } // end namespace clad
 

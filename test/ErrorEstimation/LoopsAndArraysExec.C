@@ -21,23 +21,22 @@ double runningSum(float* f, int n) {
 //CHECK-NEXT:     unsigned {{int|long}} f_size = {{0U|0UL}};
 //CHECK-NEXT:     double _d_sum = 0.;
 //CHECK-NEXT:     double sum = 0;
-//CHECK-NEXT:     unsigned {{int|long|long long}} _t0 = 0;
+//CHECK-NEXT:     unsigned int _t0;
 //CHECK-NEXT:     for (i = 1; i < n; i++) {
-//CHECK-NEXT:         _t0++;
 //CHECK-NEXT:         clad::push(_t1, sum);
 //CHECK-NEXT:         sum += f[i] + f[i - 1];
 //CHECK-NEXT:     }
 //CHECK-NEXT:     _d_sum += 1;
-//CHECK-NEXT:     for (; _t0; _t0--) {
+//CHECK-NEXT:     for (_t0 = n > 1 ? ((unsigned {{int|long|long long}})n - 1{{U|UL|ULL}}) : 0{{U|UL|ULL}}; _t0; _t0--) {
 //CHECK-NEXT:         i--;
 //CHECK-NEXT:         {
 //CHECK-NEXT:             _final_error += std::abs(_d_sum * sum * {{.+}});
 //CHECK-NEXT:             sum = clad::pop(_t1);
 //CHECK-NEXT:             double _r_d0 = _d_sum;
 //CHECK-NEXT:             _d_f[i] += _r_d0;
-//CHECK-NEXT:             f_size = std::max(f_size, i);
+//CHECK-NEXT:             f_size = std::max(f_size, static_cast<unsigned {{int|long}}>(i));
 //CHECK-NEXT:             _d_f[i - 1] += _r_d0;
-//CHECK-NEXT:             f_size = std::max(f_size, i - 1);
+//CHECK-NEXT:             f_size = std::max(f_size, static_cast<unsigned {{int|long}}>(i - 1));
 //CHECK-NEXT:         }
 //CHECK-NEXT:     }
 //CHECK-NEXT:     _final_error += std::abs(_d_sum * sum * {{.+}});
@@ -58,45 +57,39 @@ double mulSum(float* a, float* b, int n) {
 //CHECK: void mulSum_grad(float *a, float *b, int n, float *_d_a, float *_d_b, int *_d_n, double &_final_error) {
 //CHECK-NEXT:     int _d_i = 0;
 //CHECK-NEXT:     int i = 0;
-//CHECK-NEXT:     clad::tape<unsigned {{int|long|long long}}> _t1 = {};
-//CHECK-NEXT:     clad::tape<int> _t2 = {};
+//CHECK-NEXT:     unsigned int _t1;
 //CHECK-NEXT:     int _d_j = 0;
 //CHECK-NEXT:     int j = 0;
-//CHECK-NEXT:     clad::tape<double> _t3 = {};
-//CHECK-NEXT:     unsigned {{int|long}} b_size = {{0U|0UL}};
-//CHECK-NEXT:     unsigned {{int|long}} a_size = {{0U|0UL}};
+//CHECK-NEXT:     clad::tape<double> _t2 = {};
+//CHECK-NEXT:     unsigned {{int|long|long long}} b_size = 0{{U|UL|ULL}};
+//CHECK-NEXT:     unsigned {{int|long|long long}} a_size = 0{{U|UL|ULL}};
 //CHECK-NEXT:     double _d_sum = 0.;
 //CHECK-NEXT:     double sum = 0;
-//CHECK-NEXT:     unsigned {{int|long|long long}} _t0 = 0;
+//CHECK-NEXT:     unsigned int _t0;
 //CHECK-NEXT:     for (i = 0; i < n; i++) {
-//CHECK-NEXT:         _t0++;
-//CHECK-NEXT:         clad::push(_t1, 0);
-//CHECK-NEXT:         for (clad::push(_t2, j) , j = 0; j < n; j++) {
-//CHECK-NEXT:             clad::back(_t1)++;
-//CHECK-NEXT:             clad::push(_t3, sum);
+//CHECK-NEXT:         for (j = 0; j < n; j++) {
+//CHECK-NEXT:             clad::push(_t2, sum);
 //CHECK-NEXT:             sum += a[i] * b[j];
 //CHECK-NEXT:         }
 //CHECK-NEXT:     }
 //CHECK-NEXT:     _d_sum += 1;
-//CHECK-NEXT:     for (; _t0; _t0--) {
+//CHECK-NEXT:     for (_t0 = n > 0 ? (unsigned {{int|long|long long}})n : 0{{U|UL|ULL}}; _t0; _t0--) {
 //CHECK-NEXT:         i--;
 //CHECK-NEXT:         {
-//CHECK-NEXT:             for (; clad::back(_t1); clad::back(_t1)--) {
+//CHECK-NEXT:             float _acc0 = 0.F;
+//CHECK-NEXT:             for (j = n > 0 ? n : 0 , _t1 = n > 0 ? (unsigned {{int|long|long long}})n : 0{{U|UL|ULL}}; _t1; _t1--) {
 //CHECK-NEXT:                 j--;
 //CHECK-NEXT:                 _final_error += std::abs(_d_sum * sum * {{.+}});
-//CHECK-NEXT:                 sum = clad::pop(_t3);
+//CHECK-NEXT:                 sum = clad::pop(_t2);
 //CHECK-NEXT:                 double _r_d0 = _d_sum;
-//CHECK-NEXT:                 b_size = std::max(b_size, j);
-//CHECK-NEXT:                 _d_a[i] += _r_d0 * b[j];
-//CHECK-NEXT:                 a_size = std::max(a_size, i);
+//CHECK-NEXT:                 b_size = std::max(b_size, static_cast<unsigned {{int|long}}>(j));
+//CHECK-NEXT:                 _acc0 += _r_d0 * b[j];
+//CHECK-NEXT:                 a_size = std::max(a_size, static_cast<unsigned {{int|long}}>(i));
 //CHECK-NEXT:                 _d_b[j] += a[i] * _r_d0;
-//CHECK-NEXT:                 b_size = std::max(b_size, j);
+//CHECK-NEXT:                 b_size = std::max(b_size, static_cast<unsigned {{int|long}}>(j));
 //CHECK-NEXT:             }
-//CHECK-NEXT:             {
-//CHECK-NEXT:                 _d_j = 0;
-//CHECK-NEXT:                 j = clad::pop(_t2);
-//CHECK-NEXT:             }
-//CHECK-NEXT:             clad::pop(_t1);
+//CHECK-NEXT:             _d_a[i] += _acc0;
+//CHECK-NEXT:             _d_j = 0;
 //CHECK-NEXT:         }
 //CHECK-NEXT:     }
 //CHECK-NEXT:     _final_error += std::abs(_d_sum * sum * {{.+}});
@@ -124,25 +117,24 @@ double divSum(float* a, float* b, int n) {
 //CHECK-NEXT:     unsigned {{int|long}} a_size = {{0U|0UL}};
 //CHECK-NEXT:     double _d_sum = 0.;
 //CHECK-NEXT:     double sum = 0;
-//CHECK-NEXT:     unsigned {{int|long|long long}} _t0 = 0;
+//CHECK-NEXT:     unsigned int _t0;
 //CHECK-NEXT:     for (i = 0; i < n; i++) {
-//CHECK-NEXT:         _t0++;
 //CHECK-NEXT:         clad::push(_t1, sum);
 //CHECK-NEXT:         sum += a[i] / b[i];
 //CHECK-NEXT:     }
 //CHECK-NEXT:     _d_sum += 1;
-//CHECK-NEXT:     for (; _t0; _t0--) {
+//CHECK-NEXT:     for (_t0 = n > 0 ? (unsigned {{int|long|long long}})n : 0{{U|UL|ULL}}; _t0; _t0--) {
 //CHECK-NEXT:         i--;
 //CHECK-NEXT:         {
 //CHECK-NEXT:             _final_error += std::abs(_d_sum * sum * {{.+}});
 //CHECK-NEXT:             sum = clad::pop(_t1);
 //CHECK-NEXT:             double _r_d0 = _d_sum;
-//CHECK-NEXT:             b_size = std::max(b_size, i);
+//CHECK-NEXT:             b_size = std::max(b_size, static_cast<unsigned {{int|long}}>(i));
 //CHECK-NEXT:             _d_a[i] += _r_d0 / b[i];
-//CHECK-NEXT:             a_size = std::max(a_size, i);
+//CHECK-NEXT:             a_size = std::max(a_size, static_cast<unsigned {{int|long}}>(i));
 //CHECK-NEXT:             double _r0 = _r_d0 * -(a[i] / (b[i] * b[i]));
 //CHECK-NEXT:             _d_b[i] += _r0;
-//CHECK-NEXT:             b_size = std::max(b_size, i);
+//CHECK-NEXT:             b_size = std::max(b_size, static_cast<unsigned {{int|long}}>(i));
 //CHECK-NEXT:         }
 //CHECK-NEXT:     }
 //CHECK-NEXT:     _final_error += std::abs(_d_sum * sum * {{.+}});
